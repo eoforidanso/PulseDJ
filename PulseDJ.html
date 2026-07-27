@@ -1,0 +1,1692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<!-- viewport-fit=cover + interactive-widget keep the layout correct under iOS
+     notches/home-indicator and when the mobile keyboard opens. user-scalable=no
+     stops a double-tap on a jog wheel or fader from zooming the whole app. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no, interactive-widget=resizes-content" />
+<title>PULSE DJ</title>
+
+<!-- ---- PWA: installable on desktop & mobile, runs offline once cached ---- -->
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#08090c" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="PULSE DJ" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="icon" type="image/png" href="favicon-64.png" />
+
+<!-- Vendored locally so the app has no third-party/CDN dependency and the
+     service worker can cache every byte for offline use. The JSX below is
+     compiled in-browser at load (~0.5s), keeping this a single editable file. -->
+<script src="vendor/react.production.min.js"></script>
+<script src="vendor/react-dom.production.min.js"></script>
+<script src="vendor/babel.min.js"></script>
+<style>
+  :root{
+    --bg:#08090c; --panel:#101319; --panel2:#161a22; --line:#232936;
+    --txt:#e6ebf2; --dim:#7c8798; --a:#00e5ff; --b:#ff7a29;
+    --grn:#3ddc84; --red:#ff4d4d; --yel:#ffd400;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body,#root{height:100%}
+  body{
+    background:var(--bg); color:var(--txt);
+    font:13px/1.4 ui-sans-serif,-apple-system,"SF Pro Text",Inter,system-ui,sans-serif;
+    overflow:hidden; user-select:none; -webkit-font-smoothing:antialiased;
+    /* respect iOS safe areas when installed full-screen */
+    padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    touch-action:manipulation;   /* kill the 300ms tap delay / double-tap zoom on controls */
+    overscroll-behavior:none;    /* no pull-to-refresh yanking the decks around */
+  }
+  /* use the dynamic viewport height so mobile browser chrome doesn't clip the app */
+  .app{display:flex;flex-direction:column;height:100vh;height:100dvh}
+  /* touch drags on jog wheels / faders must not scroll or select the page */
+  .platter,.pitch,.vol,.xf,.knobwrap svg,.wave-main,.wave-nav{touch-action:none}
+
+  /* ---- top bar ---- */
+  .topbar{display:flex;align-items:center;gap:14px;padding:8px 14px;background:var(--panel);
+    border-bottom:1px solid var(--line);flex:0 0 auto}
+  .logo{font-weight:800;letter-spacing:3px;font-size:14px;
+    background:linear-gradient(90deg,var(--a),var(--b));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .spacer{flex:1}
+  .btn{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+    padding:5px 11px;border-radius:5px;cursor:pointer;font-size:11px;font-weight:600;letter-spacing:.6px}
+  .btn:hover{color:var(--txt);border-color:#3a4356}
+  .btn.on{background:var(--a);color:#000;border-color:var(--a)}
+  .btn.rec.on{background:var(--red);color:#fff;border-color:var(--red)}
+  .master-meter{display:flex;gap:2px;align-items:flex-end;height:16px}
+
+  /* ---- decks row ---- */
+  .decks{flex:1 1 auto;display:grid;grid-template-columns:1fr 232px 1fr;gap:1px;
+    background:var(--line);min-height:0}
+  .deck{background:var(--panel);display:flex;flex-direction:column;min-width:0;overflow:hidden}
+  .mixer{background:var(--panel);display:flex;flex-direction:column;padding:10px;gap:8px;overflow-y:auto}
+
+  .dhead{display:flex;align-items:center;gap:9px;padding:9px 12px;border-bottom:1px solid var(--line)}
+  .dbadge{width:22px;height:22px;border-radius:5px;display:grid;place-items:center;
+    font-weight:800;font-size:12px;color:#000;flex:0 0 auto}
+  .tinfo{min-width:0;flex:1}
+  .ttitle{font-weight:600;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tsub{color:var(--dim);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bpmbox{text-align:right;flex:0 0 auto}
+  .bpmval{font-variant-numeric:tabular-nums;font-weight:700;font-size:17px;line-height:1}
+  .bpmlbl{font-size:9px;color:var(--dim);letter-spacing:1.2px}
+
+  .wave-main{position:relative;height:96px;background:#05060a;cursor:ew-resize;flex:0 0 auto}
+  .wave-nav{position:relative;height:36px;background:#05060a;cursor:pointer;flex:0 0 auto;
+    border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  canvas{display:block;width:100%;height:100%}
+
+  .dbody{flex:1;display:flex;gap:10px;padding:10px;min-height:0}
+  .platter-col{display:flex;flex-direction:column;align-items:center;gap:8px;flex:0 0 auto}
+  .platter{width:118px;height:118px;border-radius:50%;position:relative;cursor:grab;
+    background:radial-gradient(circle at 50% 50%,#1c212b 0%,#0d1015 62%,#05070a 100%);
+    border:1px solid var(--line);box-shadow:inset 0 0 22px #000,0 3px 14px rgba(0,0,0,.6)}
+  .platter:active{cursor:grabbing}
+  .platter .mark{position:absolute;left:50%;top:5px;width:3px;height:26px;border-radius:2px;
+    transform-origin:50% 54px;margin-left:-1.5px}
+  .platter .hub{position:absolute;inset:38%;border-radius:50%;background:#0a0d12;border:1px solid var(--line)}
+  .ctrls{display:flex;flex-direction:column;gap:8px;flex:1;min-width:0}
+  .row{display:flex;gap:6px}
+  .tbtn{flex:1;padding:8px 4px;border-radius:6px;border:1px solid var(--line);background:var(--panel2);
+    color:var(--txt);font-size:11px;font-weight:700;cursor:pointer;letter-spacing:.5px}
+  .tbtn:hover{background:#1d222c}
+  .tbtn.play.on{background:var(--grn);color:#000;border-color:var(--grn)}
+  .tbtn.cue.on{background:var(--yel);color:#000;border-color:var(--yel)}
+  .tbtn.sync.on{background:var(--a);color:#000;border-color:var(--a)}
+
+  .cues{display:grid;grid-template-columns:repeat(4,1fr);gap:5px}
+  .hcue{height:34px;border-radius:5px;border:1px solid var(--line);background:var(--panel2);
+    color:var(--dim);font-size:10px;font-weight:700;cursor:pointer;position:relative;overflow:hidden}
+  .hcue.set{color:#000}
+  .loops{display:grid;grid-template-columns:repeat(5,1fr);gap:5px}
+  .lbtn{height:28px;border-radius:5px;border:1px solid var(--line);background:var(--panel2);
+    color:var(--dim);font-size:10.5px;font-weight:700;cursor:pointer}
+  .lbtn.on{background:var(--yel);color:#000;border-color:var(--yel)}
+
+  .eqcol{display:flex;flex-direction:column;align-items:center;gap:9px;flex:0 0 auto}
+  .knobwrap{display:flex;flex-direction:column;align-items:center;gap:3px}
+  .knoblbl{font-size:9px;color:var(--dim);letter-spacing:1px;font-weight:700}
+  .knobval{font-size:9px;color:var(--dim);font-variant-numeric:tabular-nums}
+
+  /* pitch fader */
+  .pitchwrap{display:flex;flex-direction:column;align-items:center;gap:5px;flex:0 0 auto}
+  .pitch{-webkit-appearance:none;appearance:none;writing-mode:vertical-lr;direction:rtl;
+    width:26px;height:150px;background:transparent;cursor:ns-resize}
+  .pitch::-webkit-slider-runnable-track{width:5px;background:#05070a;border:1px solid var(--line);border-radius:3px}
+  .pitch::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:15px;border-radius:3px;
+    background:linear-gradient(#3a4356,#20242e);border:1px solid #4b5568;margin-left:-11px;
+    box-shadow:0 1px 3px #000}
+
+  /* mixer */
+  .mxrow{display:flex;justify-content:space-around;align-items:flex-start}
+  .mxlabel{text-align:center;font-size:9px;letter-spacing:1.4px;color:var(--dim);font-weight:700;
+    padding:2px 0 4px;border-top:1px solid var(--line);margin-top:2px}
+  .chan{display:flex;gap:12px;justify-content:center;align-items:flex-end}
+  .vslot{display:flex;flex-direction:column;align-items:center;gap:5px}
+  .vpair{display:flex;gap:5px;align-items:center}
+  .vol{-webkit-appearance:none;appearance:none;writing-mode:vertical-lr;direction:rtl;
+    width:28px;height:118px;background:transparent;cursor:ns-resize}
+  .vol::-webkit-slider-runnable-track{width:6px;background:#05070a;border:1px solid var(--line);border-radius:3px}
+  .vol::-webkit-slider-thumb{-webkit-appearance:none;width:28px;height:17px;border-radius:3px;
+    background:linear-gradient(#414b60,#232936);border:1px solid #545f75;margin-left:-11px;box-shadow:0 1px 3px #000}
+  .meter{width:8px;height:118px;background:#05070a;border:1px solid var(--line);border-radius:3px;
+    display:flex;flex-direction:column-reverse;overflow:hidden;padding:1px;gap:1px}
+  .xf{width:100%;-webkit-appearance:none;appearance:none;height:26px;background:transparent;cursor:ew-resize}
+  .xf::-webkit-slider-runnable-track{height:6px;background:#05070a;border:1px solid var(--line);border-radius:3px}
+  .xf::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:26px;border-radius:3px;
+    background:linear-gradient(#414b60,#232936);border:1px solid #545f75;margin-top:-11px;box-shadow:0 1px 3px #000}
+
+  /* library */
+  .lib{flex:0 0 auto;height:172px;background:var(--panel);border-top:1px solid var(--line);
+    display:flex;flex-direction:column}
+  .libhead{display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid var(--line)}
+  .libhead h3{font-size:11px;letter-spacing:1.6px;color:var(--dim);font-weight:700}
+  .search{background:#05070a;border:1px solid var(--line);border-radius:5px;color:var(--txt);
+    padding:5px 9px;font-size:11.5px;width:210px;outline:none}
+  .search:focus{border-color:#3a4356}
+  .liblist{flex:1;overflow-y:auto}
+  .lrow{display:grid;grid-template-columns:1fr 90px 62px 62px 140px;gap:8px;align-items:center;
+    padding:6px 12px;border-bottom:1px solid #14181f;font-size:11.5px;cursor:grab}
+  .lrow:hover{background:#161b23}
+  .lrow .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lrow .mu{color:var(--dim);font-variant-numeric:tabular-nums}
+  .mini{padding:3px 8px;font-size:10px;border-radius:4px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--dim);cursor:pointer;font-weight:700}
+  .mini:hover{color:var(--txt)}
+  .empty{padding:26px;text-align:center;color:var(--dim);font-size:12px}
+  .drop{position:fixed;inset:0;background:rgba(0,229,255,.08);border:3px dashed var(--a);
+    display:grid;place-items:center;font-size:20px;font-weight:700;letter-spacing:2px;z-index:99;
+    pointer-events:none}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:#232936;border-radius:5px}
+  ::-webkit-scrollbar-track{background:transparent}
+  .hint{font-size:10px;color:var(--dim);letter-spacing:.4px}
+
+  /* install button in the top bar (hidden until the browser offers install) */
+  .install{background:linear-gradient(90deg,var(--a),var(--b));color:#000;border:none;
+    font-weight:800;letter-spacing:.5px;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:11px}
+
+  /* =====================================================================
+     MOBILE / NARROW LAYOUT
+     The desktop layout is a fixed 3-column deck|mixer|deck grid that assumes
+     a wide screen. Below 820px it restacks into a single scrolling column —
+     Deck A, then the mixer strip, then Deck B — and the fixed-height library
+     becomes a normal flow block so the whole thing scrolls on a phone.
+     Controls get larger tap targets (44px min, per touch guidelines).
+     ===================================================================== */
+  @media (max-width: 820px){
+    body{font-size:14px; overflow:auto}
+    .app{height:auto; min-height:100dvh}
+    .topbar{flex-wrap:wrap; gap:8px; position:sticky; top:0; z-index:20}
+    .topbar .hint{display:none}         /* keyboard-shortcut hint is desktop-only */
+
+    /* DOM order is already Deck A, mixer, Deck B, so a single column stacks
+       them in the right order with no explicit ordering needed. */
+    .decks{grid-template-columns:1fr; grid-auto-rows:auto; gap:8px}
+    .deck{overflow:visible}
+
+    .mixer{flex-direction:row; flex-wrap:wrap; justify-content:center; align-items:center;
+      gap:14px 22px; padding:12px}
+    .mixer .mxlabel{width:100%; border-top:none}
+    .chan{gap:22px}
+    .vol,.meter{height:96px}
+
+    /* the deck body was a tight horizontal strip; let it wrap on narrow screens */
+    .dbody{flex-wrap:wrap; gap:14px; justify-content:center}
+    .platter{width:150px;height:150px}
+    .platter .mark{transform-origin:50% 70px;height:32px}
+    .ctrls{min-width:260px; flex:1 1 260px}
+    .pitch{height:120px}
+
+    /* bigger, thumb-friendly hit targets */
+    .tbtn{padding:12px 4px; font-size:12px}
+    .hcue{height:44px; font-size:12px}
+    .lbtn{height:38px; font-size:12px}
+    .mini{padding:6px 9px; font-size:11px}
+    .search{width:100%}
+
+    .lib{height:auto; max-height:none; flex:0 0 auto}
+    .liblist{max-height:40vh}
+    .lrow{grid-template-columns:1fr auto auto; gap:8px}
+    .lrow .mu:nth-child(3),.lrow .mu:nth-child(4){display:none}  /* drop time & size cols */
+  }
+
+  /* coarse-pointer (touch) devices at any width: no hover affordances, bigger targets */
+  @media (pointer: coarse){
+    .tbtn:hover,.btn:hover,.mini:hover,.lbtn:hover{background:var(--panel2)}
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // Babel standalone defaults to the automatic JSX runtime, which emits a bare
+  // `import "react/jsx-runtime"` that a plain <script> cannot resolve. Pin classic.
+  Babel.registerPreset('react-classic', {
+    presets: [[Babel.availablePresets['react'], {runtime: 'classic'}]]
+  });
+</script>
+
+<script type="text/babel" data-presets="react-classic">
+const {useState,useRef,useEffect,useCallback,useMemo} = React;
+
+// Populated by the dynamic import() at the bottom of this script before
+// App() ever mounts — EngineDeck and DeckPanel only reference these once
+// that's resolved. A static `import` here would need type="module" on this
+// <script>, which Babel's classic-JSX output isn't; dynamic import() works
+// in any script context and is left untouched by the JSX transform.
+let DeckLink, MasterClock, LOOKAHEAD_SEC;
+
+/* ============================================================
+   ANALYSIS  — peaks, 3-band colouring, BPM, beat phase
+   ============================================================ */
+
+// Build per-bucket peak + 3-band energy data used to draw the waveform.
+function analysePeaks(buffer, bucketSamples){
+  const n = buffer.length;
+  const buckets = Math.ceil(n / bucketSamples);
+  const chL = buffer.getChannelData(0);
+  const chR = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : chL;
+
+  const peak = new Float32Array(buckets);
+  const low  = new Float32Array(buckets);
+  const mid  = new Float32Array(buckets);
+  const high = new Float32Array(buckets);
+
+  // One-pole splits: lp tracks bass, (x-lp) is everything above,
+  // a second pole on that separates mids from highs. Cheap but reads well.
+  const sr = buffer.sampleRate;
+  const aLow  = Math.exp(-2*Math.PI*200/sr);
+  const aMid  = Math.exp(-2*Math.PI*2000/sr);
+  let lpB=0, lpM=0;
+
+  for(let b=0;b<buckets;b++){
+    const s0=b*bucketSamples, s1=Math.min(n,s0+bucketSamples);
+    let pk=0, eL=0, eM=0, eH=0;
+    for(let i=s0;i<s1;i++){
+      const x=(chL[i]+chR[i])*0.5;
+      const ax=x<0?-x:x;
+      if(ax>pk) pk=ax;
+      lpB = x + aLow*(lpB - x);          // < 200 Hz
+      const above = x - lpB;
+      lpM = above + aMid*(lpM - above);  // 200 Hz – 2 kHz
+      const hi = above - lpM;            // > 2 kHz
+      eL += lpB*lpB; eM += lpM*lpM; eH += hi*hi;
+    }
+    const cnt = Math.max(1, s1-s0);
+    peak[b]=pk;
+    low[b]=Math.sqrt(eL/cnt); mid[b]=Math.sqrt(eM/cnt); high[b]=Math.sqrt(eH/cnt);
+  }
+  return {peak, low, mid, high, buckets, bucketSamples};
+}
+
+// Onset-energy envelope at ~172 fps, used for both tempo and beat phase.
+function onsetEnvelope(buffer){
+  const hop = 256;
+  const ch = buffer.getChannelData(0);
+  const n = buffer.length;
+  const frames = Math.floor(n/hop);
+  const env = new Float32Array(frames);
+  let prev = 0;
+  for(let f=0;f<frames;f++){
+    let e=0;
+    const s0=f*hop;
+    for(let i=s0;i<s0+hop;i++){ const x=ch[i]; e+=x*x; }
+    e=Math.sqrt(e/hop);
+    env[f]=Math.max(0, e-prev);   // half-wave rectified difference = onsets
+    prev=e;
+  }
+  return {env, fps: buffer.sampleRate/hop};
+}
+
+// Autocorrelation of the onset envelope over a musical lag range.
+function detectTempo(buffer){
+  const {env, fps} = onsetEnvelope(buffer);
+  const N = env.length;
+  if(N < 64) return {bpm:120, beatOffset:0, confidence:0};
+
+  // normalise
+  let mean=0; for(let i=0;i<N;i++) mean+=env[i]; mean/=N;
+  const e = new Float32Array(N);
+  for(let i=0;i<N;i++) e[i]=env[i]-mean;
+
+  const minBpm=70, maxBpm=185;
+  const minLag=Math.floor(fps*60/maxBpm), maxLag=Math.ceil(fps*60/minBpm);
+
+  let best=-Infinity, bestLag=minLag;
+  const scores=new Float32Array(maxLag+1);
+  for(let lag=minLag; lag<=maxLag; lag++){
+    let s=0;
+    for(let i=0;i+lag<N;i++) s+=e[i]*e[i+lag];
+    s/=(N-lag);
+    scores[lag]=s;
+    if(s>best){best=s;bestLag=lag;}
+  }
+
+  // Smooth before peak-picking: the raw curve is jittery enough that a rising
+  // shoulder can outrank the peak it leads to (this reported 90 BPM as 98.4).
+  const sm=new Float32Array(maxLag+1);
+  for(let lag=minLag; lag<=maxLag; lag++){
+    const a=scores[lag-1]!==undefined?scores[lag-1]:scores[lag];
+    const b2=scores[lag+1]!==undefined?scores[lag+1]:scores[lag];
+    sm[lag]=(a+2*scores[lag]+b2)/4;
+  }
+
+  // A periodic signal correlates just as well at 2T, 3T… as at T, so the global
+  // peak is often a multiple of the real beat. Walk up from the shortest lag and
+  // take the first genuine local maximum that clears FUND_TH — the fundamental.
+  // Requiring a local max (not just a threshold crossing) is what rejects shoulders.
+  //
+  // FUND_TH is tuned against a synthetic 90–174 BPM suite: a beat that alternates
+  // every other bar can score as low as ~0.6 of the two-beat peak, while genuine
+  // half-beat subdivisions (busy hats) stay well under. Tracks whose true beat
+  // falls below this — very alternation-heavy drum & bass — land an octave low
+  // and are corrected with the deck's ×2 button. No purely autocorrelation-based
+  // detector resolves that case; real DJ software ships the same manual override.
+  const FUND_TH = 0.60;
+  let fundLag = bestLag;
+  for(let lag=minLag+1; lag<maxLag; lag++){
+    if(sm[lag] >= best*FUND_TH && sm[lag] >= sm[lag-1] && sm[lag] >= sm[lag+1]){
+      fundLag = lag; break;
+    }
+  }
+
+  // Integer lags are ~1.6 BPM apart up here, far too coarse to beatmatch with.
+  // Fit a parabola through the peak and its neighbours for a sub-frame lag.
+  let refined = fundLag;
+  if(fundLag>minLag && fundLag<maxLag){
+    const y0=scores[fundLag-1], y1=scores[fundLag], y2=scores[fundLag+1];
+    const denom = y0 - 2*y1 + y2;
+    if(denom !== 0){
+      const shift = 0.5*(y0-y2)/denom;
+      if(Math.abs(shift) <= 1) refined = fundLag + shift;
+    }
+  }
+
+  let bpm = 60*fps/refined;
+  while(bpm > maxBpm) bpm/=2;
+  while(bpm < minBpm) bpm*=2;
+
+  // Beat phase: slide a comb of beat positions and take the best-scoring offset.
+  const lag = 60*fps/bpm;
+  let bestPhase=0, bestPhaseScore=-Infinity;
+  const steps=Math.round(lag);
+  for(let p=0;p<steps;p++){
+    let s=0, c=0;
+    for(let t=p; t<N; t+=lag){ s+=env[Math.round(t)]||0; c++; }
+    if(c) s/=c;
+    if(s>bestPhaseScore){bestPhaseScore=s;bestPhase=p;}
+  }
+
+  return {bpm:Math.round(bpm*10)/10, beatOffset:bestPhase/fps};
+}
+
+/* ============================================================
+   AUDIO ENGINE
+   ============================================================ */
+
+function makeReverbIR(ctx, seconds, decay){
+  const len = Math.floor(ctx.sampleRate*seconds);
+  const ir = ctx.createBuffer(2, len, ctx.sampleRate);
+  for(let c=0;c<2;c++){
+    const d = ir.getChannelData(c);
+    for(let i=0;i<len;i++){
+      d[i] = (Math.random()*2-1) * Math.pow(1-i/len, decay);
+    }
+  }
+  return ir;
+}
+
+// EngineDeck wraps the AudioWorklet-backed DeckLink (WSOLA time-stretch,
+// sample-accurate scheduling, phase-locked sync — see engine/deck-processor.js
+// and engine/scheduler.js) behind the same surface the UI already used when
+// this was an AudioBufferSourceNode-based class, so DeckPanel/WaveMain/WaveNav
+// needed only the handful of edits marked below rather than a full rewrite.
+// EQ, filter, and FX nodes are unchanged — the worklet swap only replaces the
+// leaf source node they were already fed from.
+class EngineDeck {
+  constructor(ctx, master){
+    this.ctx=ctx;
+    this.link=new DeckLink(ctx, 'engine/deck-processor.js');
+
+    this.track=null;
+    this.peaks=null;
+    this.sourceSampleRate=44100;
+    this._duration=0;
+
+    this.bpm=0; this.baseBpm=0; this.beatOffset=0;
+    this.cuePoint=0;
+    this.hotcues=[null,null,null,null,null,null,null,null];
+    this.loop=null;     // {start,end,beats}
+    this.keylock=true;  // true: WSOLA, tempo independent of pitch. false: classic linked varispeed.
+    this._playing=false;// commanded intent — set synchronously so the UI never waits on a worklet round trip
+    this.keySemitones=0;// musical key-shift on top of whatever keylock is doing to pitch
+    this.quantized=true;// hotcue/loop jumps snap to the next beat instead of firing immediately
+    this.slipping=false;
+    this.rolling=false; // true while a loop-roll is held
+    this.syncEngaged=false; // continuous drift correction (App-level loop) runs while true
+
+    const B=()=>ctx.createBiquadFilter();
+    this.low=B();  this.low.type='lowshelf';   this.low.frequency.value=200;
+    this.mid=B();  this.mid.type='peaking';    this.mid.frequency.value=1000; this.mid.Q.value=0.9;
+    this.high=B(); this.high.type='highshelf'; this.high.frequency.value=3200;
+    this.lpf=B();  this.lpf.type='lowpass';    this.lpf.frequency.value=22050; this.lpf.Q.value=1;
+    this.hpf=B();  this.hpf.type='highpass';   this.hpf.frequency.value=20;    this.hpf.Q.value=1;
+
+    this.trim=ctx.createGain();
+    this.vol=ctx.createGain();
+    this.xf=ctx.createGain();
+
+    // FX bus: dry always passes, wet is delay + convolution reverb in parallel.
+    this.dry=ctx.createGain();
+    this.wet=ctx.createGain(); this.wet.gain.value=0;
+    this.delay=ctx.createDelay(2.0); this.delay.delayTime.value=0.375;
+    this.fb=ctx.createGain(); this.fb.gain.value=0.35;
+    this.conv=ctx.createConvolver(); this.conv.buffer=makeReverbIR(ctx,2.4,2.6);
+    this.delayMix=ctx.createGain(); this.delayMix.gain.value=1;
+    this.revMix=ctx.createGain();   this.revMix.gain.value=0;
+
+    // link.node -> low -> mid -> high -> lpf -> hpf -> trim -> [dry|wet] -> vol -> xf -> master
+    this.low.connect(this.mid).connect(this.high).connect(this.lpf).connect(this.hpf).connect(this.trim);
+    this.trim.connect(this.dry).connect(this.vol);
+    this.trim.connect(this.wet);
+    this.wet.connect(this.delay); this.delay.connect(this.fb); this.fb.connect(this.delay);
+    this.delay.connect(this.delayMix).connect(this.vol);
+    this.wet.connect(this.conv); this.conv.connect(this.revMix).connect(this.vol);
+    this.vol.connect(this.xf).connect(master);
+
+    // The worklet node itself doesn't exist until its module registers —
+    // App() gates rendering on this before any DeckPanel can call in.
+    this.ready=this._setup();
+  }
+
+  async _setup(){
+    await this.link.ready();
+    this.link.node.connect(this.low);
+    this.link.setParams({speed:1, pitch:1, keylock:this.keylock, gain:1});
+  }
+
+  get duration(){ return this._duration; }
+  get playing(){ return this._playing; }
+  get rate(){ return this.link.speed; }
+
+  // Smoothly interpolated between the worklet's ~23ms position reports —
+  // see DeckLink.estimatedPosition in engine/scheduler.js.
+  position(){ return this.link.estimatedPosition(); }
+
+  async load(buffer, peaks, analysis, track){
+    this._playing=false;
+    this.track=track; this.peaks=peaks;
+    this.sourceSampleRate=buffer.sampleRate;
+    this._duration=buffer.duration;
+    this.baseBpm=analysis.bpm; this.bpm=analysis.bpm;
+    this.beatOffset=analysis.beatOffset;
+    this.cuePoint=0; this.loop=null;
+    this.hotcues=[null,null,null,null,null,null,null,null];
+    this.keySemitones=0; this.slipping=false; this.rolling=false; this.syncEngaged=false;
+
+    const channels=[];
+    for(let c=0;c<buffer.numberOfChannels;c++) channels.push(buffer.getChannelData(c).slice());
+    await this.link.load(channels, {bpm:this.baseBpm, beatOffset:this.beatOffset});
+    this.link.loopOff();
+  }
+
+  play(){ if(!this.track) return; this._playing=true; this.link.play(); }
+  pause(){ this._playing=false; this.link.pause(); }
+  toggle(){ this._playing ? this.pause() : this.play(); }
+  // Only SYNC's phase-lock (via MasterClock.lockToLeader, which calls
+  // seekPlay directly on the worklet) needs to flip this without also
+  // re-issuing a play — everything else goes through play()/pause().
+  markPlaying(v){ this._playing=v; }
+
+  seek(t){
+    const p=Math.max(0, Math.min(this.duration,t));
+    if(this._playing) this.link.seekPlay(p);
+    else this.link.seek(p);
+  }
+
+  // Used by hotcues and loop-start jumps: if quantize is on and the deck's
+  // actually playing (there's a beat grid in motion to snap to), schedule
+  // the jump for the next beat instead of cutting in mid-beat. Otherwise
+  // falls back to an immediate seek — same scheduler primitive either way,
+  // just a different target time.
+  jumpTo(pos){
+    const p=Math.max(0, Math.min(this.duration,pos));
+    if(this.quantized && this._playing && this.link.startCtxTime!==null){
+      const target=MasterClock.nextBeatTime(this.link, this.ctx.currentTime+LOOKAHEAD_SEC, 0)
+        ?? (this.ctx.currentTime+LOOKAHEAD_SEC);
+      this.link.seekPlay(p, target);
+    } else {
+      this.seek(p);
+    }
+  }
+
+  setRate(r){
+    // keylock on: tempo scales (speed=r), pitch held at the original (pitch=1).
+    // keylock off: classic linked vinyl behaviour — both scale together.
+    // Either way, a musical key-shift (semitones, independent control) is
+    // layered on top by multiplying in its own ratio.
+    const basePitch = this.keylock ? 1 : r;
+    const keyFactor = Math.pow(2, this.keySemitones/12);
+    // The plain varispeed render path has no independent pitch control at
+    // all — it only ever reads `speed` — so any active key-shift needs the
+    // WSOLA path regardless of the deck's own keylock toggle. This also
+    // fixes forwarding `keylock` on every call: it was previously only ever
+    // sent once, in _setup(), so toggling KEY LOCK changed EngineDeck's own
+    // flag but never actually reached the worklet.
+    const workletKeylock = this.keylock || this.keySemitones !== 0;
+    this.link.setParams({speed:r, pitch: basePitch*keyFactor, keylock: workletKeylock});
+    this.bpm=this.baseBpm ? Math.round(this.baseBpm*r*10)/10 : 0;
+  }
+
+  setKeylock(v){
+    this.keylock=v;
+    this.setRate(this.link.speed);   // recompute pitch for the new mode at the current rate
+  }
+
+  setKeyShift(semitones){
+    this.keySemitones=Math.max(-12, Math.min(12, semitones));
+    this.setRate(this.link.speed);
+  }
+
+  // Slip mode: seeks/hotcues/loops during the slip window are audible
+  // but temporary — the deck's real position keeps advancing underneath
+  // (deck-processor.js's shadowPos) and slipOff snaps back onto it.
+  slipOn(){
+    if(this.slipping) return;
+    this.slipping=true;
+    this.link.slipOn();
+  }
+  slipOff(){
+    if(!this.slipping) return;
+    this.slipping=false;
+    this.link.slipOff();
+  }
+
+  // Octave correction. Tempo detection cannot reliably tell 87 from 174 on a
+  // track whose pattern alternates every other beat, so the DJ gets the override.
+  scaleBpm(factor){
+    if(!this.baseBpm) return;
+    const next=this.baseBpm*factor;
+    if(next<40||next>250) return;
+    this.baseBpm=next;
+    this.link.bpm=next;
+    this.bpm=Math.round(next*this.link.speed*10)/10;
+  }
+
+  setCue(){ this.cuePoint=this.position(); }
+  toCue(){ this.seek(this.cuePoint); }
+
+  beatLen(){ return this.baseBpm ? 60/this.baseBpm : 0.5; }
+
+  // Snap a time to the nearest analysed beat.
+  quantize(t){
+    const bl=this.beatLen();
+    if(!bl) return t;
+    const k=Math.round((t-this.beatOffset)/bl);
+    return Math.max(0, this.beatOffset + k*bl);
+  }
+
+  setLoop(beats){
+    if(!this.track) return;
+    const start=this.quantize(this.position());
+    const end=Math.min(start + beats*this.beatLen(), this.duration);
+    this.loop={start, end, beats};
+    this.link.loopOn(start, end);
+    const p=this.position();
+    // Jumping to the loop start (when not already inside it) is exactly the
+    // kind of mid-beat cut quantize exists to avoid — route it the same way
+    // hotcues do rather than a raw seek.
+    if(!(p >= start && p < end)) this.jumpTo(start); else this.seek(p);
+  }
+  clearLoop(){
+    if(!this.loop) return;
+    this.loop=null;
+    this.link.loopOff();
+  }
+
+  // Loop roll: a momentary, self-cancelling loop — press-and-hold a short
+  // loop, and on release the track picks back up where it would have been
+  // if the roll had never happened. Built directly on slip mode: the loop
+  // is the "audible" detour, slipOff is the "snap back to real position."
+  loopRollOn(beats){
+    if(!this.track || this.rolling) return;
+    this.rolling=true;
+    this.slipOn();
+    this.setLoop(beats);
+  }
+  loopRollOff(){
+    if(!this.rolling) return;
+    this.rolling=false;
+    this.loop=null;
+    this.link.loopOff();
+    this.slipOff();
+  }
+
+  // Peak level 0..1 for the channel meter, computed by the worklet itself
+  // straight off the samples it just rendered (see deck-processor.js) —
+  // sample-accurate and immune to the silent-AnalyserNode issue headless/
+  // some low-power contexts can hit.
+  level(){ return this.link.last.levelPeak || 0; }
+}
+
+/* ============================================================
+   CONTINUOUS DRIFT CORRECTION
+   ---------------------------------------------------------------
+   SYNC's initial lock (MasterClock.lockToLeader) starts two decks on the
+   exact same sample — sufficient IF nothing ever touches either deck's
+   speed again. In practice the leader's pitch fader moves, someone rides
+   the platter, and the follower needs to keep tracking that, not just
+   match it once. This runs on a plain interval (App() below) for any
+   deck with syncEngaged set, entirely off MasterClock's closed-form
+   projections — no polling of the worklet needed.
+   ============================================================ */
+
+// Tuned on a control-loop simulation sweep (stability + convergence + no
+// audible pitch wobble): a realistic ~5ms drift settles to sub-0.5ms in
+// ~1.5s, while a large disturbance (>~37ms) resnaps click-free on the next
+// beat rather than crawling. The earlier 0.15%/0.15-beat pair never settled
+// a 5ms error and let a 40ms jerk crawl for seconds.
+const SYNC_TICK_MS = 150;
+const SYNC_KP = 1.0;                     // proportional gain on the phase error
+const SYNC_MAX_NUDGE = 0.003;            // ±0.3% (~5 cents, transient) — inaudible on music
+const SYNC_SNAP_THRESHOLD_BEATS = 0.08;  // beyond this, resnap instead of crawling back
+
+// Fraction (0..1) of the way through the deck's current native beat, at
+// wall-clock time `now`. Independent of the deck's own absolute tempo —
+// two tempo-matched decks should read the same fraction at the same instant.
+function beatPhaseFraction(deckLink, now){
+  const bl = deckLink.beatLen();
+  if(!bl) return 0;
+  const pos = MasterClock.projectedSourcePos(deckLink, now);
+  const frac = ((pos - deckLink.beatOffset)/bl) % 1;
+  return frac<0 ? frac+1 : frac;
+}
+
+function syncTick(leader, follower){
+  if(!follower.syncEngaged) return;
+  if(!leader.playing || !follower.playing) return;
+  if(!leader.baseBpm || !follower.baseBpm) return;
+
+  // Re-derive the target ratio fresh every tick — this is what makes a
+  // leader tempo change (pitch fader, platter nudge) get tracked
+  // automatically instead of requiring SYNC to be pressed again.
+  const idealBpm = leader.bpm;
+  let idealRatio = null;
+  for(const cand of [idealBpm, idealBpm*2, idealBpm/2]){
+    const c = cand/follower.baseBpm;
+    if(c>=1-PITCH_RANGE/100 && c<=1+PITCH_RANGE/100 &&
+       (idealRatio===null || Math.abs(c-1)<Math.abs(idealRatio-1))) idealRatio=c;
+  }
+  if(idealRatio===null) return;   // leader moved out of reachable range — leave follower be until it returns
+
+  const now=follower.ctx.currentTime;
+  let errFrac = beatPhaseFraction(follower.link, now) - beatPhaseFraction(leader.link, now);
+  if(errFrac > 0.5) errFrac -= 1;
+  if(errFrac < -0.5) errFrac += 1;   // shortest signed distance around the beat cycle
+
+  if(Math.abs(errFrac) > SYNC_SNAP_THRESHOLD_BEATS){
+    // Too far for a gentle nudge to close quickly — the leader was probably
+    // cued or scrubbed. Resnap with the same click-free primitive the
+    // initial SYNC press uses, rather than crawling back over many seconds.
+    follower.setRate(idealRatio);
+    MasterClock.lockToLeader(leader.link, follower.link, {beatsAhead:0, lookahead:LOOKAHEAD_SEC});
+    follower.markPlaying(true);
+    return;
+  }
+
+  const nudge = Math.max(-SYNC_MAX_NUDGE, Math.min(SYNC_MAX_NUDGE, -SYNC_KP*errFrac));
+  follower.setRate(idealRatio*(1+nudge));
+}
+
+/* ============================================================
+   UI PRIMITIVES
+   ============================================================ */
+
+function Knob({value,min,max,onChange,label,fmt,color,size=38,center=false}){
+  const ref=useRef(null);
+  const drag=useRef(null);
+
+  const down=(e)=>{
+    e.preventDefault();
+    drag.current={y:e.clientY, v:value};
+    const move=(ev)=>{
+      const d=drag.current;
+      if(!d) return;
+      const range=max-min;
+      const delta=(d.y-ev.clientY)/160*range*(ev.shiftKey?0.25:1);
+      onChange(Math.max(min,Math.min(max, d.v+delta)));
+    };
+    const up=()=>{ drag.current=null;
+      window.removeEventListener('pointermove',move);
+      window.removeEventListener('pointerup',up); };
+    window.addEventListener('pointermove',move);
+    window.addEventListener('pointerup',up);
+  };
+
+  const t=(value-min)/(max-min);
+  const ang=-135+t*270;
+  const r=size/2;
+  const arcStart = center ? -135+0.5*270 : -135;
+  const a0=Math.min(arcStart,ang), a1=Math.max(arcStart,ang);
+  const pol=(deg,rad)=>{
+    const a=(deg-90)*Math.PI/180;
+    return [r+rad*Math.cos(a), r+rad*Math.sin(a)];
+  };
+  const [x0,y0]=pol(a0,r-4), [x1,y1]=pol(a1,r-4);
+  const large=(a1-a0)>180?1:0;
+  const [mx,my]=pol(ang,r-9);
+
+  return (
+    <div className="knobwrap">
+      <svg ref={ref} width={size} height={size} onPointerDown={down}
+           style={{cursor:'ns-resize',touchAction:'none'}} onDoubleClick={()=>onChange(center?(min+max)/2:max)}>
+        <circle cx={r} cy={r} r={r-4} fill="none" stroke="#232936" strokeWidth="3"/>
+        {Math.abs(a1-a0)>0.5 &&
+          <path d={`M ${x0} ${y0} A ${r-4} ${r-4} 0 ${large} 1 ${x1} ${y1}`}
+                fill="none" stroke={color} strokeWidth="3" strokeLinecap="round"/>}
+        <circle cx={r} cy={r} r={r-10} fill="#161a22" stroke="#2b3242"/>
+        <line x1={r} y1={r} x2={mx} y2={my} stroke={color} strokeWidth="2" strokeLinecap="round"/>
+      </svg>
+      <div className="knoblbl">{label}</div>
+      {fmt && <div className="knobval">{fmt(value)}</div>}
+    </div>
+  );
+}
+
+function Meter({getLevel}){
+  const ref=useRef(null);
+  useEffect(()=>{
+    let raf;
+    const seg=18;
+    const tick=()=>{
+      const el=ref.current;
+      if(el){
+        const lv=getLevel();
+        const lit=Math.round(lv*seg);
+        for(let i=0;i<seg;i++){
+          const c=el.children[i];
+          if(!c) continue;
+          const on=i<lit;
+          c.style.background = !on ? '#12151c'
+            : i>seg-3 ? 'var(--red)' : i>seg-6 ? 'var(--yel)' : 'var(--grn)';
+        }
+      }
+      raf=requestAnimationFrame(tick);
+    };
+    tick();
+    return ()=>cancelAnimationFrame(raf);
+  },[getLevel]);
+  return <div className="meter" ref={ref}>
+    {Array.from({length:18},(_,i)=><div key={i} style={{flex:1,borderRadius:1,background:'#12151c'}}/>)}
+  </div>;
+}
+
+/* ============================================================
+   WAVEFORMS
+   ============================================================ */
+
+const CUE_COLORS=['#ff4d4d','#ffd400','#3ddc84','#00e5ff','#c77dff','#ff7a29','#4d7cff','#ff4dc4'];
+const PITCH_RANGE=16;   // percent, each way — the classic ±16% turntable range
+
+function useCanvas(draw, deps){
+  const ref=useRef(null);
+  useEffect(()=>{
+    let raf;
+    const loop=()=>{
+      const cv=ref.current;
+      if(cv){
+        const dpr=window.devicePixelRatio||1;
+        const w=cv.clientWidth, h=cv.clientHeight;
+        if(cv.width!==w*dpr||cv.height!==h*dpr){ cv.width=w*dpr; cv.height=h*dpr; }
+        const g=cv.getContext('2d');
+        g.setTransform(dpr,0,0,dpr,0,0);
+        g.clearRect(0,0,w,h);
+        draw(g,w,h);
+      }
+      raf=requestAnimationFrame(loop);
+    };
+    loop();
+    return ()=>cancelAnimationFrame(raf);
+  }, deps);
+  return ref;
+}
+
+// Scrolling, frequency-coloured detail view centred on the playhead.
+function WaveMain({deck, accent}){
+  const secondsVisible=8;
+  const ref=useCanvas((g,w,h)=>{
+    g.fillStyle='#05060a'; g.fillRect(0,0,w,h);
+    const d=deck;
+    if(!d.track||!d.peaks){
+      g.fillStyle='#2a3140'; g.font='600 11px ui-sans-serif'; g.textAlign='center';
+      g.fillText('DROP A TRACK', w/2, h/2);
+      return;
+    }
+    const sr=d.sourceSampleRate;
+    const pos=d.position();
+    const {peak,low,mid,high,bucketSamples}=d.peaks;
+    const bucketsPerSec=sr/bucketSamples;
+    const total=peak.length;
+    const spanBuckets=secondsVisible*bucketsPerSec;
+    const pxPerBucket=w/spanBuckets;
+    const centerBucket=pos*bucketsPerSec;
+    const mid_y=h/2;
+
+    // beat grid
+    const bl=d.beatLen();
+    if(bl>0){
+      const t0=pos-secondsVisible/2, t1=pos+secondsVisible/2;
+      let k=Math.ceil((t0-d.beatOffset)/bl);
+      for(let t=d.beatOffset+k*bl; t<t1; t+=bl, k++){
+        const x=w/2+(t-pos)*bucketsPerSec*pxPerBucket;
+        const downbeat=((k%4)+4)%4===0;
+        g.strokeStyle=downbeat?'rgba(255,255,255,.30)':'rgba(255,255,255,.10)';
+        g.lineWidth=downbeat?1.5:1;
+        g.beginPath(); g.moveTo(x,0); g.lineTo(x,h); g.stroke();
+      }
+    }
+
+    // loop region
+    if(d.loop){
+      const xs=w/2+(d.loop.start-pos)*bucketsPerSec*pxPerBucket;
+      const xe=w/2+(d.loop.end-pos)*bucketsPerSec*pxPerBucket;
+      g.fillStyle='rgba(255,212,0,.13)'; g.fillRect(xs,0,xe-xs,h);
+      g.strokeStyle='rgba(255,212,0,.75)'; g.lineWidth=1.5;
+      g.beginPath(); g.moveTo(xs,0); g.lineTo(xs,h); g.moveTo(xe,0); g.lineTo(xe,h); g.stroke();
+    }
+
+    // waveform, band-coloured
+    const step=Math.max(1, Math.round(1/pxPerBucket));
+    for(let px=0; px<w; px+=1){
+      const b=Math.round(centerBucket + (px-w/2)/pxPerBucket);
+      if(b<0||b>=total) continue;
+      const amp=peak[b];
+      const l=low[b], m=mid[b], hi=high[b];
+      const sum=l+m+hi+1e-9;
+      const R=Math.round(60+195*(l/sum));
+      const G=Math.round(70+185*(m/sum));
+      const Bc=Math.round(80+175*(hi/sum));
+      const hh=amp*(h/2-3);
+      g.fillStyle=`rgb(${R},${G},${Bc})`;
+      g.fillRect(px, mid_y-hh, 1, hh*2);
+    }
+
+    // hot cues
+    d.hotcues.forEach((c,i)=>{
+      if(c==null) return;
+      const x=w/2+(c-pos)*bucketsPerSec*pxPerBucket;
+      if(x<-10||x>w+10) return;
+      g.fillStyle=CUE_COLORS[i];
+      g.fillRect(x-1,0,2,h);
+      g.fillRect(x-1,0,13,12);
+      g.fillStyle='#000'; g.font='700 9px ui-sans-serif'; g.textAlign='center';
+      g.fillText(String(i+1), x+5.5, 9);
+    });
+
+    // playhead
+    g.fillStyle=accent;
+    g.fillRect(w/2-1,0,2,h);
+    g.fillStyle='rgba(0,0,0,.55)';
+    g.beginPath(); g.moveTo(w/2-6,0); g.lineTo(w/2+6,0); g.lineTo(w/2,8); g.closePath();
+    g.fillStyle=accent; g.fill();
+  },[deck,accent]);
+
+  // Grab-and-drag scrub: the sample under the pointer stays under the pointer
+  // as you drag (drag left to advance, like riding a record edge). Position is
+  // recomputed absolutely from the grab point each move, so it tracks the
+  // cursor even while the deck keeps playing underneath. A tap that never moves
+  // falls back to the old click-to-seek-by-offset-from-centre.
+  const scrub=useRef(null);
+  const down=(e)=>{
+    const d=deck;
+    if(!d.track) return;
+    e.preventDefault();
+    const r=e.currentTarget.getBoundingClientRect();
+    scrub.current={x0:e.clientX, pos0:d.position(), width:r.width, left:r.left, moved:false};
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  };
+  const move=(e)=>{
+    const s=scrub.current; if(!s) return;
+    const dx=e.clientX-s.x0;
+    if(Math.abs(dx)>2) s.moved=true;
+    deck.seek(s.pos0 - dx/s.width*secondsVisible);
+  };
+  const up=(e)=>{
+    const s=scrub.current; if(!s) return;
+    if(!s.moved){
+      const dx=(e.clientX-s.left)-s.width/2;
+      deck.seek(s.pos0 + dx/s.width*secondsVisible);
+    }
+    scrub.current=null;
+  };
+  return <div className="wave-main" onPointerDown={down} onPointerMove={move}
+              onPointerUp={up} onPointerCancel={up}><canvas ref={ref}/></div>;
+}
+
+// Whole-track overview.
+function WaveNav({deck, accent}){
+  const ref=useCanvas((g,w,h)=>{
+    g.fillStyle='#05060a'; g.fillRect(0,0,w,h);
+    const d=deck;
+    if(!d.track||!d.peaks) return;
+    const {peak,low,mid,high}=d.peaks;
+    const total=peak.length;
+    const my=h/2;
+    for(let px=0;px<w;px++){
+      const b0=Math.floor(px/w*total), b1=Math.floor((px+1)/w*total);
+      let pk=0,l=0,m=0,hi=0,c=0;
+      for(let b=b0;b<Math.max(b0+1,b1);b++){
+        if(peak[b]>pk)pk=peak[b];
+        l+=low[b];m+=mid[b];hi+=high[b];c++;
+      }
+      const sum=l+m+hi+1e-9;
+      const R=Math.round(55+200*(l/sum)), G=Math.round(65+190*(m/sum)), Bc=Math.round(75+180*(hi/sum));
+      const hh=pk*(h/2-2);
+      g.fillStyle=`rgb(${R},${G},${Bc})`;
+      g.fillRect(px,my-hh,1,hh*2);
+    }
+    if(d.loop){
+      const xs=d.loop.start/d.duration*w, xe=d.loop.end/d.duration*w;
+      g.fillStyle='rgba(255,212,0,.20)'; g.fillRect(xs,0,Math.max(1,xe-xs),h);
+    }
+    d.hotcues.forEach((c,i)=>{
+      if(c==null)return;
+      g.fillStyle=CUE_COLORS[i];
+      g.fillRect(c/d.duration*w-1,0,2,h);
+    });
+    const x=d.position()/d.duration*w;
+    g.fillStyle=accent; g.fillRect(x-1,0,2,h);
+  },[deck,accent]);
+
+  const jump=(e)=>{
+    const d=deck; if(!d.track) return;
+    const r=e.currentTarget.getBoundingClientRect();
+    d.seek((e.clientX-r.left)/r.width*d.duration);
+  };
+  return <div className="wave-nav" onClick={jump}><canvas ref={ref}/></div>;
+}
+
+/* ============================================================
+   DECK UI
+   ============================================================ */
+
+const fmtTime=(s)=>{
+  if(!isFinite(s)||s<0) s=0;
+  const m=Math.floor(s/60), r=Math.floor(s%60), c=Math.floor((s%1)*100);
+  return `${m}:${String(r).padStart(2,'0')}.${String(c).padStart(2,'0')}`;
+};
+
+function DeckPanel({deck, id, accent, other, bump}){
+  const [,force]=useState(0);
+  const [pitch,setPitch]=useState(0);           // percent
+  const [eq,setEq]=useState({low:0,mid:0,high:0});
+  const [filter,setFilter]=useState(0);         // -1 .. 1
+  const [fx,setFx]=useState({amount:0, type:'delay'});
+  const [syncFail,setSyncFail]=useState(false);
+  const [keylock,setKeylockUi]=useState(true);
+  const [keySemis,setKeySemis]=useState(0);
+  const [quantized,setQuantizedUi]=useState(true);
+  const [ui,setUi]=useState({pos:0,playing:false,sync:false,slipping:false,rolling:false});
+  const platterRef=useRef(null);
+
+  const toggleKeylock=()=>{
+    const v=!keylock;
+    setKeylockUi(v);
+    deck.setKeylock(v);
+    bump();
+  };
+
+  const applyKeyShift=(s)=>{
+    setKeySemis(s);
+    deck.setKeyShift(s);
+    bump();
+  };
+
+  const toggleQuantize=()=>{
+    const v=!quantized;
+    setQuantizedUi(v);
+    deck.quantized=v;
+    bump();
+  };
+
+  // Light-weight UI clock — the canvases animate themselves at 60fps. Also
+  // where the continuous drift-corrector's effect on syncEngaged surfaces —
+  // it can disengage sync itself (leader drifted out of pitch range), so the
+  // SYNC button's state has to come from the engine, not a one-time click flag.
+  useEffect(()=>{
+    const iv=setInterval(()=>setUi({
+      pos:deck.position(), playing:deck.playing,
+      sync:deck.syncEngaged, slipping:deck.slipping, rolling:deck.rolling
+    }),60);
+    return ()=>clearInterval(iv);
+  },[deck]);
+
+  const rerender=()=>force(x=>x+1);
+
+  const applyPitch=(p)=>{
+    setPitch(p);
+    deck.setRate(1+p/100);
+    deck.syncEngaged=false;   // manual override drops out of auto-sync
+    bump();
+  };
+
+  const doSync=()=>{
+    if(!deck.baseBpm||!other.baseBpm) return;
+    const target=other.bpm||other.baseBpm;
+
+    // The pitch fader only spans ±PITCH_RANGE, so a raw ratio outside it would
+    // be silently clamped and the decks would drift while SYNC claimed a lock.
+    // Try octave folds first, so half-time/double-time material still locks.
+    let r=null;
+    for(const cand of [target, target*2, target/2]){
+      const c=cand/deck.baseBpm;
+      if(c>=1-PITCH_RANGE/100 && c<=1+PITCH_RANGE/100 &&
+         (r===null || Math.abs(c-1)<Math.abs(r-1))) r=c;
+    }
+    if(r===null){ setSyncFail(true); setTimeout(()=>setSyncFail(false),1200); return; }
+
+    deck.setRate(r);
+    setPitch(Math.round((r-1)*1000)/10);
+
+    // Phase-align by scheduling an atomic seek+play on this deck's grid at an
+    // exact future sample on the OTHER deck's clock (MasterClock.lockToLeader,
+    // engine/scheduler.js) — sample-accurate by construction, not a jittery
+    // "read both positions, compute an offset, hope nothing moved" correction.
+    // Only meaningful against a deck that's actually rolling: with nothing
+    // playing there's no beat grid in motion yet to lock onto.
+    if(other.playing){
+      MasterClock.lockToLeader(other.link, deck.link, {beatsAhead:0, lookahead:0.05});
+      deck.markPlaying(true);
+    }
+    // Sticky: App()'s drift-correction loop keeps nudging this deck toward
+    // the leader's grid — including tracking the leader's tempo if it
+    // changes — for as long as syncEngaged stays true.
+    deck.syncEngaged=true;
+    bump();
+  };
+
+  const setEqBand=(band,v)=>{
+    setEq(e=>({...e,[band]:v}));
+    const node = band==='low'?deck.low : band==='mid'?deck.mid : deck.high;
+    node.gain.setTargetAtTime(v, deck.ctx.currentTime, 0.01);
+  };
+
+  const setFilterKnob=(v)=>{
+    setFilter(v);
+    const t=deck.ctx.currentTime;
+    if(v<0){ // low-pass sweep
+      const f=22050*Math.pow(200/22050, -v);
+      deck.lpf.frequency.setTargetAtTime(f,t,0.01);
+      deck.hpf.frequency.setTargetAtTime(20,t,0.01);
+    } else if(v>0){ // high-pass sweep
+      const f=20*Math.pow(8000/20, v);
+      deck.hpf.frequency.setTargetAtTime(f,t,0.01);
+      deck.lpf.frequency.setTargetAtTime(22050,t,0.01);
+    } else {
+      deck.lpf.frequency.setTargetAtTime(22050,t,0.01);
+      deck.hpf.frequency.setTargetAtTime(20,t,0.01);
+    }
+  };
+
+  const setFxAmount=(v)=>{
+    setFx(f=>({...f,amount:v}));
+    deck.wet.gain.setTargetAtTime(v, deck.ctx.currentTime, 0.02);
+  };
+  const setFxType=(type)=>{
+    setFx(f=>({...f,type}));
+    const t=deck.ctx.currentTime;
+    deck.delayMix.gain.setTargetAtTime(type==='delay'?1:0,t,0.02);
+    deck.revMix.gain.setTargetAtTime(type==='reverb'?1:0,t,0.02);
+    if(type==='delay' && deck.baseBpm){
+      deck.delay.delayTime.setTargetAtTime(deck.beatLen()*0.75/deck.rate, t, 0.05);
+    }
+  };
+
+  const hotcue=(i,e)=>{
+    if(e.shiftKey || e.altKey){ deck.hotcues[i]=null; rerender(); return; }
+    if(deck.hotcues[i]==null) deck.hotcues[i]=deck.position();
+    else deck.jumpTo(deck.hotcues[i]);
+    rerender();
+  };
+
+  // Platter drag = nudge (temporary rate change), like riding a record edge.
+  const platterDown=(e)=>{
+    if(!deck.track) return;
+    e.preventDefault();
+    deck.syncEngaged=false; bump();   // manual nudge overrides auto-sync, like the pitch fader
+    const startX=e.clientX;
+    const base=deck.rate;
+    const move=(ev)=>{
+      const dx=(ev.clientX-startX)/200;
+      deck.setRate(Math.max(0.05, base*(1+Math.max(-0.6,Math.min(0.6,dx)))));
+    };
+    const up=()=>{
+      deck.setRate(base);
+      window.removeEventListener('pointermove',move);
+      window.removeEventListener('pointerup',up);
+    };
+    window.addEventListener('pointermove',move);
+    window.addEventListener('pointerup',up);
+  };
+
+  const t=deck.track;
+  const rot=(ui.pos*(deck.baseBpm?deck.baseBpm/60:2)*360)%360;
+  const remain=deck.duration-ui.pos;
+  // While SYNC is holding the deck, the drift corrector nudges the real rate
+  // every 150ms, so show the live effective pitch (read off the engine) rather
+  // than the stale value doSync wrote once. The 60ms UI tick re-reads it.
+  const effPitch = ui.sync ? (deck.rate-1)*100 : pitch;
+
+  return (
+    <div className="deck">
+      <div className="dhead">
+        <div className="dbadge" style={{background:accent}}>{id}</div>
+        <div className="tinfo">
+          <div className="ttitle">{t?t.title:'— no track loaded —'}</div>
+          <div className="tsub">
+            {t? `${t.artist}` : 'drop an audio file anywhere'}
+            {deck.track && ` · ${fmtTime(ui.pos)} / -${fmtTime(remain)}`}
+          </div>
+        </div>
+        <div className="bpmbox">
+          <div className="bpmval" style={{color:accent}}>
+            {deck.bpm? deck.bpm.toFixed(1) : '--.-'}
+          </div>
+          <div className="bpmlbl">BPM</div>
+        </div>
+        <div style={{display:'flex',flexDirection:'column',gap:3}}>
+          <button className="mini" title="double the detected tempo"
+                  onClick={()=>{deck.scaleBpm(2);rerender();}}>×2</button>
+          <button className="mini" title="halve the detected tempo"
+                  onClick={()=>{deck.scaleBpm(0.5);rerender();}}>÷2</button>
+        </div>
+      </div>
+
+      <WaveMain deck={deck} accent={accent}/>
+      <WaveNav deck={deck} accent={accent}/>
+
+      <div className="dbody">
+        <div className="platter-col">
+          <div className="platter" ref={platterRef} onPointerDown={platterDown}>
+            <div className="mark" style={{background:accent, transform:`rotate(${rot}deg)`}}/>
+            <div className="hub"/>
+          </div>
+          <div className="hint">drag to nudge</div>
+        </div>
+
+        <div className="ctrls">
+          <div className="row">
+            <button className={'tbtn play'+(ui.playing?' on':'')}
+                    onClick={()=>{deck.toggle();bump();}}>
+              {ui.playing?'❚❚ PAUSE':'▶ PLAY'}
+            </button>
+            <button className="tbtn cue"
+                    onPointerDown={()=>{ if(!deck.playing){deck.setCue();} deck.toCue(); deck.play(); bump(); }}
+                    onPointerUp={()=>{ deck.pause(); deck.toCue(); bump(); }}>CUE</button>
+            <button className={'tbtn sync'+(ui.sync?' on':'')} onClick={doSync}
+                    style={syncFail?{background:'var(--red)',color:'#fff',borderColor:'var(--red)'}:null}
+                    title={`match tempo to the other deck and keep it phase-locked (within ±${PITCH_RANGE}%)`}>
+              {syncFail?'OUT OF RANGE':'SYNC'}
+            </button>
+            <button className={'tbtn'+(ui.slipping?' on':'')} onClick={()=>{ ui.slipping?deck.slipOff():deck.slipOn(); rerender(); }}
+                    style={ui.slipping?{background:'var(--yel)',color:'#000',borderColor:'var(--yel)'}:null}
+                    title="slip mode: seeks/hotcues/loops play a temporary detour — the real position keeps advancing underneath and playback snaps back to it when you turn slip off">
+              SLIP
+            </button>
+          </div>
+
+          <div className="row" style={{gap:6}}>
+            <span className="hint" style={{alignSelf:'center'}}>HOTCUES</span>
+            <button className={'mini'+(quantized?' on':'')}
+                    style={quantized?{background:accent,color:'#000',borderColor:accent}:null}
+                    onClick={toggleQuantize}
+                    title="ON: hotcue/loop jumps snap to the next beat. OFF: jump immediately, mid-beat.">
+              QUANT {quantized?'ON':'OFF'}
+            </button>
+          </div>
+
+          <div className="cues">
+            {deck.hotcues.map((c,i)=>(
+              <button key={i} className={'hcue'+(c!=null?' set':'')}
+                      style={c!=null?{background:CUE_COLORS[i],borderColor:CUE_COLORS[i]}:null}
+                      onClick={(e)=>hotcue(i,e)}
+                      title={c!=null?'click to jump · shift-click to clear':'click to set'}>
+                {i+1}
+              </button>
+            ))}
+          </div>
+
+          <div className="loops">
+            {[1,2,4,8].map(b=>(
+              <button key={b}
+                      className={'lbtn'+(deck.loop&&deck.loop.beats===b&&!deck.rolling?' on':'')}
+                      onClick={()=>{ deck.loop&&deck.loop.beats===b?deck.clearLoop():deck.setLoop(b); rerender(); }}>
+                {b}
+              </button>
+            ))}
+            <button className="lbtn" onClick={()=>{deck.clearLoop();rerender();}}>✕</button>
+          </div>
+
+          <div className="loops" title="loop roll — hold for a momentary loop, release to snap back to where the track really is">
+            {[0.25,0.5,1,2].map(b=>(
+              <button key={b} className={'lbtn'+(ui.rolling&&deck.loop&&deck.loop.beats===b?' on':'')}
+                      onPointerDown={()=>{deck.loopRollOn(b); rerender();}}
+                      onPointerUp={()=>{deck.loopRollOff(); rerender();}}
+                      onPointerLeave={()=>{ if(deck.rolling) deck.loopRollOff(); rerender(); }}>
+                {b<1?'1/'+Math.round(1/b):b} ROLL
+              </button>
+            ))}
+          </div>
+
+          <div className="row" style={{gap:8,alignItems:'center'}}>
+            <Knob label="FILTER" value={filter} min={-1} max={1} center
+                  onChange={setFilterKnob} color={accent} size={40}
+                  fmt={v=>v===0?'off':(v<0?'LP ':'HP ')+Math.round(Math.abs(v)*100)}/>
+            <Knob label="FX" value={fx.amount} min={0} max={1}
+                  onChange={setFxAmount} color={accent} size={40}
+                  fmt={v=>Math.round(v*100)+'%'}/>
+            <div style={{display:'flex',flexDirection:'column',gap:4}}>
+              {['delay','reverb'].map(ty=>(
+                <button key={ty} className={'mini'+(fx.type===ty?' on':'')}
+                        style={fx.type===ty?{background:accent,color:'#000',borderColor:accent}:null}
+                        onClick={()=>setFxType(ty)}>{ty.toUpperCase()}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="eqcol">
+          <Knob label="HI" value={eq.high} min={-26} max={12} center color={accent}
+                onChange={v=>setEqBand('high',v)} fmt={v=>v.toFixed(0)+'dB'} size={36}/>
+          <Knob label="MID" value={eq.mid} min={-26} max={12} center color={accent}
+                onChange={v=>setEqBand('mid',v)} fmt={v=>v.toFixed(0)+'dB'} size={36}/>
+          <Knob label="LOW" value={eq.low} min={-26} max={12} center color={accent}
+                onChange={v=>setEqBand('low',v)} fmt={v=>v.toFixed(0)+'dB'} size={36}/>
+        </div>
+
+        <div className="pitchwrap">
+          <div className="knoblbl" style={{color:accent}}>
+            {effPitch>0?'+':''}{effPitch.toFixed(1)}%
+          </div>
+          <input className="pitch" type="range" min={-PITCH_RANGE} max={PITCH_RANGE} step="0.02"
+                 value={effPitch} onChange={e=>applyPitch(parseFloat(e.target.value))}/>
+          <button className="mini" onClick={()=>applyPitch(0)}>RESET</button>
+          <button className="mini" onClick={toggleKeylock}
+                  style={keylock?{background:accent,color:'#000',borderColor:accent}:null}
+                  title="ON: change tempo without shifting pitch (time-stretch). OFF: classic linked pitch/tempo, like vinyl.">
+            KEY {keylock?'LOCK':'OFF'}
+          </button>
+
+          <Knob label="KEY" value={keySemis} min={-12} max={12} center color={accent} size={40}
+                onChange={v=>applyKeyShift(Math.round(v))}
+                fmt={v=>(v>0?'+':'')+v+' st'}/>
+          <button className="mini" onClick={()=>applyKeyShift(0)}>RESET KEY</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   APP
+   ============================================================ */
+
+function App(){
+  const engine=useRef(null);
+  if(!engine.current){
+    // 'interactive' asks the platform for the smallest safe buffer — the
+    // low-latency-routing half of the punch list; there's nothing else to
+    // configure since ScriptProcessorNode was never used in this graph.
+    const ctx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
+    const master=ctx.createGain();
+    const limiter=ctx.createDynamicsCompressor();
+    limiter.threshold.value=-2; limiter.knee.value=0;
+    limiter.ratio.value=20; limiter.attack.value=0.002; limiter.release.value=0.15;
+    const masterAnalyser=ctx.createAnalyser(); masterAnalyser.fftSize=512;
+    const recDest=ctx.createMediaStreamDestination();
+    master.connect(limiter).connect(masterAnalyser).connect(ctx.destination);
+    masterAnalyser.connect(recDest);
+    engine.current={
+      ctx, master, masterAnalyser, recDest,
+      a:new EngineDeck(ctx,master), b:new EngineDeck(ctx,master),
+      _md:new Uint8Array(masterAnalyser.frequencyBinCount)
+    };
+    // Handy for poking at the graph from the console.
+    window.__PULSE = engine.current;
+  }
+  const E=engine.current;
+
+  // The worklet module has to finish registering before either deck's node
+  // exists — everything below assumes E.a/E.b are already playable.
+  const [engineReady,setEngineReady]=useState(false);
+  useEffect(()=>{ Promise.all([E.a.ready, E.b.ready]).then(()=>setEngineReady(true)); },[]);
+
+  const [lib,setLib]=useState([]);
+  const [q,setQ]=useState('');
+  const [xfade,setXfade]=useState(0.5);
+  const [volA,setVolA]=useState(0.8);
+  const [volB,setVolB]=useState(0.8);
+  const [masterVol,setMasterVol]=useState(0.85);
+  const [dropping,setDropping]=useState(false);
+  const [busy,setBusy]=useState('');
+  const [recording,setRecording]=useState(false);
+  const recRef=useRef(null);
+  const [,bump]=useState(0);
+  const force=()=>bump(x=>x+1);
+
+  // --- PWA install ---
+  // Chromium fires beforeinstallprompt when the app is installable; we stash
+  // the event and surface our own button, since the browser's default mini-
+  // infobar is easy to miss. iOS Safari has no such event — there we show a
+  // one-line "Add to Home Screen" hint instead (handled in the button below).
+  const installEvt=useRef(null);
+  const [canInstall,setCanInstall]=useState(false);
+  const [installed,setInstalled]=useState(
+    window.matchMedia('(display-mode: standalone)').matches ||
+    window.navigator.standalone === true
+  );
+  useEffect(()=>{
+    const onPrompt=(e)=>{ e.preventDefault(); installEvt.current=e; setCanInstall(true); };
+    const onInstalled=()=>{ setInstalled(true); setCanInstall(false); installEvt.current=null; };
+    window.addEventListener('beforeinstallprompt',onPrompt);
+    window.addEventListener('appinstalled',onInstalled);
+    return ()=>{ window.removeEventListener('beforeinstallprompt',onPrompt);
+                 window.removeEventListener('appinstalled',onInstalled); };
+  },[]);
+  const doInstall=async()=>{
+    const e=installEvt.current;
+    if(e){ e.prompt(); await e.userChoice; installEvt.current=null; setCanInstall(false); }
+    else {
+      // iOS / browsers without the prompt event: tell the user the manual path.
+      const ios=/iP(hone|ad|od)/.test(navigator.platform) || (navigator.userAgent.includes('Mac') && 'ontouchend' in document);
+      alert(ios
+        ? 'To install: tap the Share button, then "Add to Home Screen".'
+        : 'To install: open your browser menu and choose "Install PULSE DJ" / "Add to Home screen".');
+    }
+  };
+
+  // --- crossfader: constant-power curve so the middle doesn't dip ---
+  useEffect(()=>{
+    const t=E.ctx.currentTime;
+    E.a.xf.gain.setTargetAtTime(Math.cos(xfade*Math.PI/2), t, 0.01);
+    E.b.xf.gain.setTargetAtTime(Math.cos((1-xfade)*Math.PI/2), t, 0.01);
+  },[xfade]);
+  useEffect(()=>{ E.a.vol.gain.setTargetAtTime(volA,E.ctx.currentTime,0.01); },[volA]);
+  useEffect(()=>{ E.b.vol.gain.setTargetAtTime(volB,E.ctx.currentTime,0.01); },[volB]);
+  useEffect(()=>{ E.master.gain.setTargetAtTime(masterVol,E.ctx.currentTime,0.01); },[masterVol]);
+
+  // --- continuous drift correction (see syncTick above) ---
+  useEffect(()=>{
+    const iv=setInterval(()=>{ syncTick(E.a,E.b); syncTick(E.b,E.a); }, SYNC_TICK_MS);
+    return ()=>clearInterval(iv);
+  },[]);
+
+  // The drift corrector mutates deck.bpm off-React (inside its interval), so
+  // App-level readouts that depend on it — the BPM-delta line below — would
+  // otherwise show stale values until the next user action. A slow re-render
+  // tick keeps them live without the cost of a per-frame loop.
+  useEffect(()=>{ const iv=setInterval(()=>force(), 200); return ()=>clearInterval(iv); },[]);
+
+  // --- file ingest ---
+  const ingest=useCallback(async(files)=>{
+    const audio=[...files].filter(f=>/\.(mp3|wav|m4a|aac|ogg|flac|aiff?|opus|webm)$/i.test(f.name)||f.type.startsWith('audio'));
+    if(!audio.length) return;
+    for(let i=0;i<audio.length;i++){
+      const f=audio[i];
+      setBusy(`Analysing ${f.name} (${i+1}/${audio.length})…`);
+      try{
+        const buf=await E.ctx.decodeAudioData(await f.arrayBuffer());
+        const peaks=analysePeaks(buf, 512);
+        const analysis=detectTempo(buf);
+        const base=f.name.replace(/\.[^.]+$/,'');
+        const m=base.match(/^(.*?)\s*[-–]\s*(.*)$/);
+        setLib(L=>[...L,{
+          id:Math.random().toString(36).slice(2),
+          file:f, buffer:buf, peaks, analysis,
+          title:(m?m[2]:base).trim(),
+          artist:(m?m[1]:'Unknown artist').trim(),
+          bpm:analysis.bpm, duration:buf.duration
+        }]);
+      }catch(err){
+        console.warn('decode failed', f.name, err);
+        setBusy(`Could not decode ${f.name}`);
+        await new Promise(r=>setTimeout(r,1200));
+      }
+    }
+    setBusy('');
+  },[]);
+
+  const loadTo=async(track,which)=>{
+    E.ctx.resume();
+    const d=which==='a'?E.a:E.b;
+    await d.load(track.buffer, track.peaks, track.analysis, track);
+    force();
+  };
+
+  // Drop a track from the library list, releasing its decoded AudioBuffer for
+  // GC. A deck that already loaded it keeps its own reference and plays on —
+  // this only removes the library entry, it doesn't unload a live deck.
+  const removeTrack=(id)=>setLib(L=>L.filter(t=>t.id!==id));
+
+  // --- drag & drop ---
+  useEffect(()=>{
+    const over=e=>{e.preventDefault();setDropping(true);};
+    const leave=e=>{ if(e.clientX===0&&e.clientY===0) setDropping(false); };
+    const drop=e=>{e.preventDefault();setDropping(false);ingest(e.dataTransfer.files);};
+    window.addEventListener('dragover',over);
+    window.addEventListener('dragleave',leave);
+    window.addEventListener('drop',drop);
+    return ()=>{
+      window.removeEventListener('dragover',over);
+      window.removeEventListener('dragleave',leave);
+      window.removeEventListener('drop',drop);
+    };
+  },[ingest]);
+
+  // --- keyboard ---
+  useEffect(()=>{
+    const onKey=(e)=>{
+      if(e.target.tagName==='INPUT') return;
+      if(!E.a.link.node||!E.b.link.node) return;  // worklets not registered yet
+      const k=e.key.toLowerCase();
+      E.ctx.resume();
+      const map={
+        q:()=>E.a.toggle(), p:()=>E.b.toggle(),
+        w:()=>{E.a.toCue();}, o:()=>{E.b.toCue();},
+        e:()=>{E.a.setCue();}, i:()=>{E.b.setCue();},
+      };
+      if(map[k]){ e.preventDefault(); map[k](); force(); return; }
+      // Detect the digit via e.code, not e.key, so Shift+number still
+      // identifies the pad (Shift+1 reports e.key "!"). Shift/Alt clears the
+      // cue; otherwise set-or-jump exactly like the on-screen pads — quantized
+      // and slip-aware via jumpTo, rather than the old raw seek.
+      const digit = /^Digit[0-9]$/.test(e.code) ? e.code.slice(5) : null;
+      const kbHotcue=(deck,i)=>{
+        if(e.shiftKey||e.altKey) deck.hotcues[i]=null;
+        else if(deck.hotcues[i]==null) deck.hotcues[i]=deck.position();
+        else deck.jumpTo(deck.hotcues[i]);
+        force();
+      };
+      if(digit && '1234'.includes(digit)){ e.preventDefault(); kbHotcue(E.a, +digit-1); return; }
+      if(digit && '7890'.includes(digit)){ e.preventDefault(); kbHotcue(E.b, digit==='0'?3:+digit-7); return; }
+      if(e.key==='ArrowLeft'){ setXfade(v=>Math.max(0,v-0.05)); }
+      if(e.key==='ArrowRight'){ setXfade(v=>Math.min(1,v+0.05)); }
+      if(e.code==='Space'){ e.preventDefault(); setXfade(v=>v<0.5?1:0); }
+    };
+    window.addEventListener('keydown',onKey);
+    return ()=>window.removeEventListener('keydown',onKey);
+  },[]);
+
+  // --- master meter ---
+  const masterRef=useRef(null);
+  useEffect(()=>{
+    let raf;
+    const tick=()=>{
+      const el=masterRef.current;
+      if(el){
+        E.masterAnalyser.getByteFrequencyData(E._md);
+        let m=0; for(let i=0;i<E._md.length;i++) if(E._md[i]>m) m=E._md[i];
+        const lit=Math.round(m/255*12);
+        for(let i=0;i<12;i++){
+          const c=el.children[i]; if(!c) continue;
+          c.style.background = i<lit ? (i>9?'var(--red)':i>7?'var(--yel)':'var(--grn)') : '#1a1f28';
+        }
+      }
+      raf=requestAnimationFrame(tick);
+    };
+    tick(); return ()=>cancelAnimationFrame(raf);
+  },[]);
+
+  // --- recording the master mix ---
+  // Safari's MediaRecorder doesn't support WebM (only MP4/AAC), so a
+  // hardcoded 'audio/webm' throws NotSupportedError there — and Safari/iOS is
+  // exactly the platform the PWA bits above target. Pick the first supported
+  // container instead, and let an empty options fall back to the UA default.
+  const pickRecMime=()=>{
+    const cands=['audio/webm;codecs=opus','audio/webm','audio/mp4;codecs=mp4a.40.2','audio/mp4'];
+    if(typeof MediaRecorder==='undefined' || !MediaRecorder.isTypeSupported) return '';
+    return cands.find(t=>MediaRecorder.isTypeSupported(t)) || '';
+  };
+  const toggleRec=()=>{
+    if(recording){ recRef.current && recRef.current.stop(); return; }
+    if(typeof MediaRecorder==='undefined'){
+      alert('Recording isn’t supported in this browser.');
+      return;
+    }
+    let mr;
+    try{
+      const mime=pickRecMime();
+      mr=new MediaRecorder(E.recDest.stream, mime?{mimeType:mime}:undefined);
+    }catch(err){
+      console.warn('MediaRecorder init failed', err);
+      alert('Recording couldn’t start in this browser.');
+      return;
+    }
+    const chunks=[];
+    mr.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+    mr.onstop=()=>{
+      // Derive the file extension from what the recorder actually produced,
+      // not a fixed .webm — an .mp4 blob renamed .webm won't play.
+      const type=mr.mimeType||chunks[0]?.type||'audio/webm';
+      const ext=/mp4|aac|mpeg/i.test(type)?'m4a':/ogg/i.test(type)?'ogg':'webm';
+      const blob=new Blob(chunks,{type});
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(blob);
+      a.download=`pulse-set-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.${ext}`;
+      a.click();
+      setRecording(false);
+    };
+    mr.start(); recRef.current=mr; setRecording(true);
+  };
+
+  const shown=useMemo(()=>{
+    const s=q.trim().toLowerCase();
+    return s? lib.filter(t=>(t.title+' '+t.artist).toLowerCase().includes(s)) : lib;
+  },[lib,q]);
+
+  const fileInput=useRef(null);
+
+  if(!engineReady){
+    return (
+      <div className="app" style={{display:'grid',placeItems:'center'}}>
+        <div className="hint">Initializing audio engine…</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app" onPointerDown={()=>E.ctx.resume()}>
+      {dropping && <div className="drop">DROP TO LOAD</div>}
+
+      <div className="topbar">
+        <div className="logo">PULSE&nbsp;DJ</div>
+        <button className="btn" onClick={()=>fileInput.current.click()}>+ ADD TRACKS</button>
+        <input ref={fileInput} type="file" accept="audio/*" multiple hidden
+               onChange={e=>{ingest(e.target.files); e.target.value='';}}/>
+        <span className="hint">{busy || 'drag audio files anywhere · Q/P play · W/O cue · 1-4 & 7-0 hotcues · ←/→ crossfade · space slam'}</span>
+        <div className="spacer"/>
+        <div className="master-meter" ref={masterRef}>
+          {Array.from({length:12},(_,i)=>
+            <div key={i} style={{width:4,height:4+i*1,background:'#1a1f28',borderRadius:1}}/>)}
+        </div>
+        <button className={'btn rec'+(recording?' on':'')} onClick={toggleRec}>
+          {recording?'■ STOP REC':'● REC MIX'}
+        </button>
+        {!installed &&
+          <button className="install" onClick={doInstall} title="Install PULSE DJ as an app">
+            {canInstall?'⬇ INSTALL':'📱 INSTALL'}
+          </button>}
+      </div>
+
+      <div className="decks">
+        <DeckPanel deck={E.a} id="A" accent="var(--a)" other={E.b} bump={force}/>
+
+        <div className="mixer">
+          <div className="mxlabel" style={{borderTop:'none',marginTop:0}}>MASTER</div>
+          <div style={{display:'flex',justifyContent:'center'}}>
+            <Knob label="GAIN" value={masterVol} min={0} max={1.2} color="#e6ebf2" size={46}
+                  onChange={setMasterVol} fmt={v=>Math.round(v*100)+'%'}/>
+          </div>
+
+          <div className="mxlabel">CHANNEL FADERS</div>
+          <div className="chan">
+            <div className="vslot">
+              <div className="vpair">
+                <Meter getLevel={()=>E.a.level()}/>
+                <input className="vol" type="range" min="0" max="1" step="0.01"
+                       value={volA} onChange={e=>setVolA(parseFloat(e.target.value))}/>
+              </div>
+              <div className="knoblbl" style={{color:'var(--a)'}}>A</div>
+            </div>
+            <div className="vslot">
+              <div className="vpair">
+                <input className="vol" type="range" min="0" max="1" step="0.01"
+                       value={volB} onChange={e=>setVolB(parseFloat(e.target.value))}/>
+                <Meter getLevel={()=>E.b.level()}/>
+              </div>
+              <div className="knoblbl" style={{color:'var(--b)'}}>B</div>
+            </div>
+          </div>
+
+          <div className="mxlabel">CROSSFADER</div>
+          <input className="xf" type="range" min="0" max="1" step="0.01"
+                 value={xfade} onChange={e=>setXfade(parseFloat(e.target.value))}/>
+          <div style={{display:'flex',justifyContent:'space-between',fontSize:9,color:'var(--dim)',fontWeight:700}}>
+            <span style={{color:'var(--a)'}}>A</span>
+            <button className="mini" onClick={()=>setXfade(0.5)}>CENTER</button>
+            <span style={{color:'var(--b)'}}>B</span>
+          </div>
+
+          <div className="mxlabel">BEAT MATCH</div>
+          <div style={{textAlign:'center',fontSize:11,color:'var(--dim)',fontVariantNumeric:'tabular-nums'}}>
+            {E.a.bpm&&E.b.bpm
+              ? <span>Δ {Math.abs(E.a.bpm-E.b.bpm).toFixed(1)} BPM</span>
+              : <span>load both decks</span>}
+          </div>
+        </div>
+
+        <DeckPanel deck={E.b} id="B" accent="var(--b)" other={E.a} bump={force}/>
+      </div>
+
+      <div className="lib">
+        <div className="libhead">
+          <h3>LIBRARY · {lib.length}</h3>
+          <input className="search" placeholder="Search title or artist…"
+                 value={q} onChange={e=>setQ(e.target.value)}/>
+          <div className="spacer" style={{flex:1}}/>
+          <span className="hint">double-click a row to load the free deck</span>
+        </div>
+        <div className="liblist">
+          {shown.length===0 && <div className="empty">
+            Drag audio files anywhere in the window, or hit <b>+ ADD TRACKS</b>.<br/>
+            Each track is analysed for tempo, beat grid and frequency content on import.
+          </div>}
+          {shown.map(t=>(
+            <div key={t.id} className="lrow"
+                 onDoubleClick={()=>loadTo(t, E.a.playing && !E.b.playing ? 'b' : 'a')}>
+              <div className="nm"><b>{t.title}</b> <span style={{color:'var(--dim)'}}>— {t.artist}</span></div>
+              <div className="mu">{t.bpm.toFixed(1)} BPM</div>
+              <div className="mu">{fmtTime(t.duration).split('.')[0]}</div>
+              <div className="mu">{Math.round(t.file.size/1048576*10)/10} MB</div>
+              <div style={{display:'flex',gap:6}}>
+                <button className="mini" style={{color:'var(--a)',borderColor:'#1d3d47'}}
+                        onClick={()=>loadTo(t,'a')}>→ A</button>
+                <button className="mini" style={{color:'var(--b)',borderColor:'#4a2e18'}}
+                        onClick={()=>loadTo(t,'b')}>→ B</button>
+                <button className="mini" title="remove from library"
+                        onClick={(e)=>{e.stopPropagation();removeTrack(t.id);}}>✕</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+(async()=>{
+  ({DeckLink, MasterClock, LOOKAHEAD_SEC} = await import('./engine/scheduler.js'));
+  ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+})();
+
+// Service worker: only registrable over https:// or http://localhost (the
+// platform enforces this — a plain file:// or a bare http:// LAN IP will
+// silently have no `serviceWorker` support, or registration will reject).
+// This is also the install-eligibility gate: Chromium won't fire
+// beforeinstallprompt without a controlling service worker + manifest.
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('sw.js').catch(err=>{
+      console.warn('Service worker registration failed (offline/installability will be unavailable):', err);
+    });
+  });
+}
+</script>
+</body>
+</html>
