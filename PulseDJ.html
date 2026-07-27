@@ -112,6 +112,24 @@
   .knoblbl{font-size:9px;color:var(--dim);letter-spacing:1px;font-weight:700}
   .knobval{font-size:9px;color:var(--dim);font-variant-numeric:tabular-nums}
 
+  /* FX SLOT — one-shot / looped sampler pad, sits under the EQ knobs */
+  .fxslot{display:flex;flex-direction:column;align-items:stretch;gap:4px;width:96px;
+    margin-top:2px;padding-top:8px;border-top:1px solid var(--line)}
+  .fxslot .knoblbl{text-align:center}
+  .fxsel{background:#05070a;border:1px solid var(--line);color:var(--txt);border-radius:5px;
+    font-size:10px;padding:4px 5px;outline:none;width:100%}
+  .fxsel:focus{border-color:#3a4356}
+  .fxpad{padding:9px 4px;border-radius:6px;border:1px solid var(--line);background:var(--panel2);
+    color:var(--txt);font-size:10.5px;font-weight:700;cursor:pointer;letter-spacing:.4px}
+  .fxpad:hover:not(:disabled){background:#1d222c}
+  .fxpad:active:not(:disabled){background:var(--a);color:#000;border-color:var(--a)}
+  .fxpad:disabled,.fxlbtn:disabled{opacity:.35;cursor:not-allowed}
+  .fxloops{display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
+  .fxlbtn{height:26px;border-radius:5px;border:1px solid var(--line);background:var(--panel2);
+    color:var(--dim);font-size:10px;font-weight:700;cursor:pointer}
+  .fxlbtn.on{background:var(--yel);color:#000;border-color:var(--yel)}
+  .fxlbtn:hover:not(:disabled):not(.on){background:#1d222c;color:var(--txt)}
+
   /* pitch fader */
   .pitchwrap{display:flex;flex-direction:column;align-items:center;gap:5px;flex:0 0 auto}
   .pitch{-webkit-appearance:none;appearance:none;writing-mode:vertical-lr;direction:rtl;
@@ -149,14 +167,23 @@
     padding:5px 9px;font-size:11.5px;width:210px;outline:none}
   .search:focus{border-color:#3a4356}
   .liblist{flex:1;overflow-y:auto}
-  .lrow{display:grid;grid-template-columns:1fr 90px 62px 62px 140px;gap:8px;align-items:center;
+  .lrow{display:grid;grid-template-columns:1fr 88px 90px 60px 60px 140px;gap:8px;align-items:center;
     padding:6px 12px;border-bottom:1px solid #14181f;font-size:11.5px;cursor:grab}
   .lrow:hover{background:#161b23}
-  .lrow .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lrow .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
   .lrow .mu{color:var(--dim);font-variant-numeric:tabular-nums}
   .mini{padding:3px 8px;font-size:10px;border-radius:4px;border:1px solid var(--line);
     background:var(--panel2);color:var(--dim);cursor:pointer;font-weight:700}
   .mini:hover{color:var(--txt)}
+  /* per-row FX tag selector + header filter chips */
+  .tagsel{background:#05070a;border:1px solid var(--line);color:var(--dim);border-radius:4px;
+    font-size:10px;padding:3px 4px;outline:none;width:100%;cursor:pointer;font-weight:700}
+  .tagsel:focus{border-color:#3a4356}
+  .tagchips{display:flex;gap:5px;align-items:center}
+  .chip{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+    padding:4px 9px;border-radius:11px;cursor:pointer;font-size:10px;font-weight:700;letter-spacing:.5px}
+  .chip:hover{color:var(--txt)}
+  .chip.on{background:var(--a);color:#000;border-color:var(--a)}
   .empty{padding:26px;text-align:center;color:var(--dim);font-size:12px}
   .drop{position:fixed;inset:0;background:rgba(0,229,255,.08);border:3px dashed var(--a);
     display:grid;place-items:center;font-size:20px;font-weight:700;letter-spacing:2px;z-index:99;
@@ -210,9 +237,12 @@
     .search{width:100%}
 
     .lib{height:auto; max-height:none; flex:0 0 auto}
+    .libhead{flex-wrap:wrap}
+    .libhead .hint{display:none}       /* "double-click" tip is desktop-only */
+    .tagchips{flex-wrap:wrap}          /* filter chips wrap under the search box */
     .liblist{max-height:40vh}
-    .lrow{grid-template-columns:1fr auto auto; gap:8px}
-    .lrow .mu:nth-child(3),.lrow .mu:nth-child(4){display:none}  /* drop time & size cols */
+    .lrow{grid-template-columns:1fr auto auto auto; gap:8px}   /* name · tag · bpm · actions */
+    .lrow .mu:nth-child(4),.lrow .mu:nth-child(5){display:none}  /* drop time & size cols */
   }
 
   /* coarse-pointer (touch) devices at any width: no hover affordances, bigger targets */
@@ -460,6 +490,14 @@ class EngineDeck {
     this.wet.connect(this.conv); this.conv.connect(this.revMix).connect(this.vol);
     this.vol.connect(this.xf).connect(master);
 
+    // FX sampler: one-shot / looped clips (risers, impacts, sweeps, stingers)
+    // fired from the deck's FX slot. Routed straight to master — independent of
+    // this deck's EQ, channel fader and the crossfader — so a drop cuts through
+    // the mix. It still passes the master limiter, so it can't clip the output.
+    this.fxSamplerGain=ctx.createGain(); this.fxSamplerGain.gain.value=0.9;
+    this.fxSamplerGain.connect(master);
+    this.fxSource=null;   // the currently-playing one-shot/loop source, or null
+
     // The worklet node itself doesn't exist until its module registers —
     // App() gates rendering on this before any DeckPanel can call in.
     this.ready=this._setup();
@@ -633,6 +671,34 @@ class EngineDeck {
   // sample-accurate and immune to the silent-AnalyserNode issue headless/
   // some low-power contexts can hit.
   level(){ return this.link.last.levelPeak || 0; }
+
+  // Fire an FX sample through the sampler bus. mode==='oneshot' plays it once
+  // to its end; a number N loops its first N beats (deck-tempo-synced) until
+  // stopped or retriggered. Retriggering always cuts the previous shot first,
+  // so a pad never stacks copies of itself.
+  playFx(buffer, mode='oneshot'){
+    if(!buffer) return;
+    this.ctx.resume();
+    this.stopFx();
+    const src=this.ctx.createBufferSource();
+    src.buffer=buffer;
+    if(typeof mode==='number'){
+      src.loop=true;
+      src.loopStart=0;
+      src.loopEnd=Math.min(buffer.duration, mode*this.beatLen());
+    }
+    src.connect(this.fxSamplerGain);
+    src.onended=()=>{ if(this.fxSource===src) this.fxSource=null; };
+    src.start();
+    this.fxSource=src;
+  }
+  stopFx(){
+    if(!this.fxSource) return;
+    const s=this.fxSource; this.fxSource=null;
+    try{ s.onended=null; s.stop(); }catch(e){}
+    try{ s.disconnect(); }catch(e){}
+  }
+  fxPlaying(){ return this.fxSource!==null; }
 }
 
 /* ============================================================
@@ -793,6 +859,20 @@ function Meter({getLevel}){
 
 const CUE_COLORS=['#ff4d4d','#ffd400','#3ddc84','#00e5ff','#c77dff','#ff7a29','#4d7cff','#ff4dc4'];
 const PITCH_RANGE=16;   // percent, each way — the classic ±16% turntable range
+
+// FX-file categories used both to tag library rows and to populate each deck's
+// FX slot. Colours double as the row-pill / filter-chip accent per tag.
+const FX_TAGS=['Sweep','Riser','Impact','Stinger'];
+const TAG_COLORS={Sweep:'#00e5ff',Riser:'#c77dff',Impact:'#ff4d4d',Stinger:'#ffd400'};
+// Best-effort tag guess from a filename on import; the row dropdown overrides it.
+function detectTag(name){
+  const s=name.toLowerCase();
+  if(/riser|uplifter|\bbuild\b|\brise\b/.test(s)) return 'Riser';
+  if(/sweep|whoosh|swoosh|sweeper/.test(s))       return 'Sweep';
+  if(/impact|\bboom\b|\bslam\b|\bhit\b|crash|\bdrop\b/.test(s)) return 'Impact';
+  if(/stinger|\bstab\b|\bsting\b/.test(s))        return 'Stinger';
+  return null;
+}
 
 function useCanvas(draw, deps){
   const ref=useRef(null);
@@ -982,7 +1062,7 @@ const fmtTime=(s)=>{
   return `${m}:${String(r).padStart(2,'0')}.${String(c).padStart(2,'0')}`;
 };
 
-function DeckPanel({deck, id, accent, other, bump}){
+function DeckPanel({deck, id, accent, other, bump, fxItems}){
   const [,force]=useState(0);
   const [pitch,setPitch]=useState(0);           // percent
   const [eq,setEq]=useState({low:0,mid:0,high:0});
@@ -993,7 +1073,20 @@ function DeckPanel({deck, id, accent, other, bump}){
   const [keySemis,setKeySemis]=useState(0);
   const [quantized,setQuantizedUi]=useState(true);
   const [ui,setUi]=useState({pos:0,playing:false,sync:false,slipping:false,rolling:false});
+  const [fxId,setFxId]=useState('');            // library id loaded into this deck's FX slot
+  const [fxLoop,setFxLoop]=useState(0);         // beats currently looping (0 = one-shot / idle)
   const platterRef=useRef(null);
+
+  // Keep a valid selection: if the loaded FX sample is removed/untagged, fall
+  // back to nothing rather than pointing at a stale id.
+  const fxItem = fxItems.find(t=>t.id===fxId) || null;
+  const fxOneShot=()=>{ if(!fxItem) return; deck.playFx(fxItem.buffer,'oneshot'); setFxLoop(0); };
+  const fxLoopToggle=(beats)=>{
+    if(!fxItem) return;
+    if(fxLoop===beats){ deck.stopFx(); setFxLoop(0); }
+    else { deck.playFx(fxItem.buffer, beats); setFxLoop(beats); }
+  };
+  const fxStop=()=>{ deck.stopFx(); setFxLoop(0); };
 
   const toggleKeylock=()=>{
     const v=!keylock;
@@ -1268,6 +1361,28 @@ function DeckPanel({deck, id, accent, other, bump}){
                 onChange={v=>setEqBand('mid',v)} fmt={v=>v.toFixed(0)+'dB'} size={36}/>
           <Knob label="LOW" value={eq.low} min={-26} max={12} center color={accent}
                 onChange={v=>setEqBand('low',v)} fmt={v=>v.toFixed(0)+'dB'} size={36}/>
+
+          <div className="fxslot">
+            <div className="knoblbl">FX SLOT</div>
+            <select className="fxsel" value={fxId} onChange={e=>{deck.stopFx();setFxLoop(0);setFxId(e.target.value);}}
+                    style={fxItem&&fxItem.tag?{borderColor:TAG_COLORS[fxItem.tag]}:null}
+                    title={fxItem?fxItem.title:'tag an FX file in the library to load it here'}>
+              <option value="">— none —</option>
+              {fxItems.map(t=>(
+                <option key={t.id} value={t.id}>{t.tag?`[${t.tag[0]}] `:''}{t.title}</option>
+              ))}
+            </select>
+            <button className="fxpad" onClick={fxOneShot} disabled={!fxItem}
+                    title="one-shot — play the sample once, no loop">▶ ONE-SHOT</button>
+            <div className="fxloops">
+              {[1,2,4].map(b=>(
+                <button key={b} className={'fxlbtn'+(fxLoop===b?' on':'')}
+                        onClick={()=>fxLoopToggle(b)} disabled={!fxItem}
+                        title={`loop the sample for ${b} beat${b>1?'s':''} (tap again to stop)`}>{b}</button>
+              ))}
+              <button className="fxlbtn" onClick={fxStop} disabled={!fxItem} title="stop FX">✕</button>
+            </div>
+          </div>
         </div>
 
         <div className="pitchwrap">
@@ -1411,7 +1526,8 @@ function App(){
           file:f, buffer:buf, peaks, analysis,
           title:(m?m[2]:base).trim(),
           artist:(m?m[1]:'Unknown artist').trim(),
-          bpm:analysis.bpm, duration:buf.duration
+          bpm:analysis.bpm, duration:buf.duration,
+          tag:detectTag(f.name)   // Sweep/Riser/Impact/Stinger guess; editable per row
         }]);
       }catch(err){
         console.warn('decode failed', f.name, err);
@@ -1433,6 +1549,12 @@ function App(){
   // GC. A deck that already loaded it keeps its own reference and plays on —
   // this only removes the library entry, it doesn't unload a live deck.
   const removeTrack=(id)=>setLib(L=>L.filter(t=>t.id!==id));
+
+  // Set/clear a library row's FX tag (Sweep/Riser/Impact/Stinger).
+  const setTag=(id,tag)=>setLib(L=>L.map(t=>t.id===id?{...t,tag:tag||null}:t));
+  // Only tagged files populate the decks' FX slots.
+  const fxItems=useMemo(()=>lib.filter(t=>t.tag),[lib]);
+  const [tagFilter,setTagFilter]=useState('');   // '' = show all; else a single FX tag
 
   // --- drag & drop ---
   useEffect(()=>{
@@ -1547,8 +1669,12 @@ function App(){
 
   const shown=useMemo(()=>{
     const s=q.trim().toLowerCase();
-    return s? lib.filter(t=>(t.title+' '+t.artist).toLowerCase().includes(s)) : lib;
-  },[lib,q]);
+    return lib.filter(t=>{
+      if(tagFilter && t.tag!==tagFilter) return false;
+      if(s && !(t.title+' '+t.artist).toLowerCase().includes(s)) return false;
+      return true;
+    });
+  },[lib,q,tagFilter]);
 
   const fileInput=useRef(null);
 
@@ -1585,7 +1711,7 @@ function App(){
       </div>
 
       <div className="decks">
-        <DeckPanel deck={E.a} id="A" accent="var(--a)" other={E.b} bump={force}/>
+        <DeckPanel deck={E.a} id="A" accent="var(--a)" other={E.b} bump={force} fxItems={fxItems}/>
 
         <div className="mixer">
           <div className="mxlabel" style={{borderTop:'none',marginTop:0}}>MASTER</div>
@@ -1631,7 +1757,7 @@ function App(){
           </div>
         </div>
 
-        <DeckPanel deck={E.b} id="B" accent="var(--b)" other={E.a} bump={force}/>
+        <DeckPanel deck={E.b} id="B" accent="var(--b)" other={E.a} bump={force} fxItems={fxItems}/>
       </div>
 
       <div className="lib">
@@ -1639,6 +1765,14 @@ function App(){
           <h3>LIBRARY · {lib.length}</h3>
           <input className="search" placeholder="Search title or artist…"
                  value={q} onChange={e=>setQ(e.target.value)}/>
+          <div className="tagchips">
+            <button className={'chip'+(tagFilter===''?' on':'')} onClick={()=>setTagFilter('')}>ALL</button>
+            {FX_TAGS.map(tg=>(
+              <button key={tg} className={'chip'+(tagFilter===tg?' on':'')}
+                      style={tagFilter===tg?{background:TAG_COLORS[tg],color:'#000',borderColor:TAG_COLORS[tg]}:null}
+                      onClick={()=>setTagFilter(tg)}>{tg}</button>
+            ))}
+          </div>
           <div className="spacer" style={{flex:1}}/>
           <span className="hint">double-click a row to load the free deck</span>
         </div>
@@ -1651,6 +1785,13 @@ function App(){
             <div key={t.id} className="lrow"
                  onDoubleClick={()=>loadTo(t, E.a.playing && !E.b.playing ? 'b' : 'a')}>
               <div className="nm"><b>{t.title}</b> <span style={{color:'var(--dim)'}}>— {t.artist}</span></div>
+              <select className="tagsel" value={t.tag||''}
+                      onClick={e=>e.stopPropagation()}
+                      onChange={e=>setTag(t.id, e.target.value)}
+                      style={t.tag?{color:'#000',background:TAG_COLORS[t.tag],borderColor:TAG_COLORS[t.tag]}:null}>
+                <option value="">— tag —</option>
+                {FX_TAGS.map(tg=><option key={tg} value={tg}>{tg}</option>)}
+              </select>
               <div className="mu">{t.bpm.toFixed(1)} BPM</div>
               <div className="mu">{fmtTime(t.duration).split('.')[0]}</div>
               <div className="mu">{Math.round(t.file.size/1048576*10)/10} MB</div>
