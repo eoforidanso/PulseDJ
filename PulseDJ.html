@@ -542,13 +542,57 @@ class EngineDeck {
     this.delayMix=ctx.createGain(); this.delayMix.gain.value=1;
     this.revMix=ctx.createGain();   this.revMix.gain.value=0;
 
+    // Flanger: short delay (0.5-5ms) modulated by LFO, mixed with dry
+    this.flanger=ctx.createDelay(0.02);
+    this.flangerLfo=ctx.createOscillator(); this.flangerLfo.frequency.value=0.5;
+    this.flangerLfoGain=ctx.createGain(); this.flangerLfoGain.gain.value=0.0045;
+    this.flangerMix=ctx.createGain(); this.flangerMix.gain.value=0.5;
+    this.flangerFb=ctx.createGain(); this.flangerFb.gain.value=0.3;
+    this.flangerLfo.connect(this.flangerLfoGain).connect(this.flanger.delayTime);
+    this.flangerLfo.start();
+
+    // Phaser: all-pass filters cascade, modulated by LFO
+    this.phaserLfo=ctx.createOscillator(); this.phaserLfo.frequency.value=0.3;
+    this.phaserLfoGain=ctx.createGain(); this.phaserLfoGain.gain.value=2000;
+    this.phaserMix=ctx.createGain(); this.phaserMix.gain.value=0.5;
+    this.phaserFb=ctx.createGain(); this.phaserFb.gain.value=0.5;
+    const phaserFilters=[]; for(let i=0;i<4;i++){
+      const f=ctx.createBiquadFilter(); f.type='allpass'; f.Q.value=1;
+      phaserFilters.push(f);
+    }
+    this.phaserFilters=phaserFilters;
+    this.phaserLfo.connect(this.phaserLfoGain);
+    for(const f of phaserFilters) this.phaserLfoGain.connect(f.frequency);
+    this.phaserLfo.start();
+
+    // Echo: longer delay (400-800ms) with feedback, separate from regular delay
+    this.echo=ctx.createDelay(1.0);
+    this.echoMix=ctx.createGain(); this.echoMix.gain.value=0;
+    this.echoFb=ctx.createGain(); this.echoFb.gain.value=0.4;
+
     // link.node -> low -> mid -> high -> lpf -> hpf -> trim -> [dry|wet] -> vol -> xf -> master
     this.low.connect(this.mid).connect(this.high).connect(this.lpf).connect(this.hpf).connect(this.trim);
     this.trim.connect(this.dry).connect(this.vol);
     this.trim.connect(this.wet);
+
+    // Delay and reverb (existing)
     this.wet.connect(this.delay); this.delay.connect(this.fb); this.fb.connect(this.delay);
     this.delay.connect(this.delayMix).connect(this.vol);
     this.wet.connect(this.conv); this.conv.connect(this.revMix).connect(this.vol);
+
+    // Flanger: wet -> flanger (with feedback loop) -> flangerMix -> vol
+    this.wet.connect(this.flanger); this.flanger.connect(this.flangerFb); this.flangerFb.connect(this.flanger);
+    this.flanger.connect(this.flangerMix).connect(this.vol);
+
+    // Phaser: wet -> phaser filters cascade -> phaserMix -> vol
+    this.wet.connect(this.phaserFilters[0]);
+    for(let i=0; i<this.phaserFilters.length-1; i++) this.phaserFilters[i].connect(this.phaserFilters[i+1]);
+    this.phaserFilters[this.phaserFilters.length-1].connect(this.phaserMix).connect(this.vol);
+
+    // Echo: wet -> echo (with feedback) -> echoMix -> vol
+    this.wet.connect(this.echo); this.echo.connect(this.echoFb); this.echoFb.connect(this.echo);
+    this.echo.connect(this.echoMix).connect(this.vol);
+
     this.vol.connect(this.xf).connect(master);
 
     // FX sampler: one-shot / looped clips (risers, impacts, sweeps, stingers)
@@ -1255,10 +1299,18 @@ function DeckPanel({deck, id, accent, other, bump, fxItems}){
   const setFxType=(type)=>{
     setFx(f=>({...f,type}));
     const t=deck.ctx.currentTime;
+    // Route wet signal to selected FX type only
     deck.delayMix.gain.setTargetAtTime(type==='delay'?1:0,t,0.02);
     deck.revMix.gain.setTargetAtTime(type==='reverb'?1:0,t,0.02);
+    deck.flangerMix.gain.setTargetAtTime(type==='flanger'?1:0,t,0.02);
+    deck.phaserMix.gain.setTargetAtTime(type==='phaser'?1:0,t,0.02);
+    deck.echoMix.gain.setTargetAtTime(type==='echo'?1:0,t,0.02);
+    // Tempo-sync delay time if needed
     if(type==='delay' && deck.baseBpm){
       deck.delay.delayTime.setTargetAtTime(deck.beatLen()*0.75/deck.rate, t, 0.05);
+    }
+    if(type==='echo' && deck.baseBpm){
+      deck.echo.delayTime.setTargetAtTime(deck.beatLen()*2/deck.rate, t, 0.05);
     }
   };
 
@@ -1406,10 +1458,12 @@ function DeckPanel({deck, id, accent, other, bump, fxItems}){
                   onChange={setFxAmount} color={accent} size={40}
                   fmt={v=>Math.round(v*100)+'%'}/>
             <div style={{display:'flex',flexDirection:'column',gap:4}}>
-              {['delay','reverb'].map(ty=>(
+              {['delay','reverb','flanger','phaser','echo'].map(ty=>(
                 <button key={ty} className={'mini'+(fx.type===ty?' on':'')}
                         style={fx.type===ty?{background:accent,color:'#000',borderColor:accent}:null}
-                        onClick={()=>setFxType(ty)}>{ty.toUpperCase()}</button>
+                        onClick={()=>setFxType(ty)}
+                        title={ty===('delay')?'Delay (tempo-synced)':ty===('reverb')?'Reverb (spatial)':ty===('flanger')?'Flanger (sweep)':ty===('phaser')?'Phaser (notch filter)':'Echo (long delay)'}
+                        >{ty.slice(0,3).toUpperCase()}</button>
               ))}
             </div>
           </div>
