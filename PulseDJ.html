@@ -27,7 +27,7 @@
 <style>
   :root{
     --bg:#08090c; --panel:#101319; --panel2:#161a22; --line:#232936;
-    --txt:#e6ebf2; --dim:#7c8798; --a:#00e5ff; --b:#ff7a29;
+    --txt:#e6ebf2; --dim:#7c8798; --a:#00e5ff; --b:#ff7a29; --c:#b16cff; --d:#ff4db8;
     --grn:#3ddc84; --red:#ff4d4d; --yel:#ffd400;
   }
   *{box-sizing:border-box;margin:0;padding:0}
@@ -59,9 +59,21 @@
   .btn.rec.on{background:var(--red);color:#fff;border-color:var(--red)}
   .master-meter{display:flex;gap:2px;align-items:flex-end;height:16px}
 
-  /* ---- decks row ---- */
-  .decks{flex:1 1 auto;display:grid;grid-template-columns:1fr 232px 1fr;gap:1px;
-    background:var(--line);min-height:0}
+  /* ---- decks row ----
+     Two independent deck|mixer|deck rows (A/B, then C/D) stacked in a flex
+     column. Each row keeps its own crossfader — the two pairs sum together
+     on the master bus via each deck's channel fader, so there's no separate
+     "blend" control needed between the pairs.
+     Each row sizes to its natural content height (flex:0 0 auto) rather than
+     splitting the viewport 50/50 — a full deck (waveform, hotcues, loops, EQ,
+     FX slot) needs more room than half a typical screen leaves, so squeezing
+     it would just clip controls. deckrows scrolls instead: on a tall enough
+     display both rows fit with no scrolling, on a shorter one you scroll down
+     to reach C/D exactly like the whole page already does on mobile. */
+  .deckrows{flex:1 1 auto;display:flex;flex-direction:column;gap:6px;
+    background:var(--bg);min-height:0;overflow-y:auto}
+  .decks{flex:0 0 auto;display:grid;grid-template-columns:1fr 232px 1fr;gap:1px;
+    background:var(--line)}
   .deck{background:var(--panel);display:flex;flex-direction:column;min-width:0;overflow:hidden}
   .mixer{background:var(--panel);display:flex;flex-direction:column;padding:10px;gap:8px;overflow-y:auto}
 
@@ -211,9 +223,13 @@
     .topbar{flex-wrap:wrap; gap:8px; position:sticky; top:0; z-index:20}
     .topbar .hint{display:none}         /* keyboard-shortcut hint is desktop-only */
 
-    /* DOM order is already Deck A, mixer, Deck B, so a single column stacks
-       them in the right order with no explicit ordering needed. */
-    .decks{grid-template-columns:1fr; grid-auto-rows:auto; gap:8px}
+    /* DOM order is already Deck A, mixer, Deck B, [Deck C, mixer, Deck D],
+       so a single column stacks them in the right order with no explicit
+       ordering needed. deckrows drops out of the layout (display:contents)
+       so its two .decks rows become direct flex children of .app instead of
+       being squeezed into equal halves of one flex row's height. */
+    .deckrows{display:contents}
+    .decks{grid-template-columns:1fr; grid-auto-rows:auto; gap:8px; margin-bottom:8px}
     .deck{overflow:visible}
 
     .mixer{flex-direction:row; flex-wrap:wrap; justify-content:center; align-items:center;
@@ -1545,6 +1561,7 @@ function App(){
     engine.current={
       ctx, master, masterAnalyser, recDest,
       a:new EngineDeck(ctx,master), b:new EngineDeck(ctx,master),
+      c:new EngineDeck(ctx,master), d:new EngineDeck(ctx,master),
       _md:new Uint8Array(masterAnalyser.frequencyBinCount)
     };
     // Handy for poking at the graph from the console.
@@ -1552,16 +1569,19 @@ function App(){
   }
   const E=engine.current;
 
-  // The worklet module has to finish registering before either deck's node
-  // exists — everything below assumes E.a/E.b are already playable.
+  // The worklet module has to finish registering before any deck's node
+  // exists — everything below assumes E.a/E.b/E.c/E.d are already playable.
   const [engineReady,setEngineReady]=useState(false);
-  useEffect(()=>{ Promise.all([E.a.ready, E.b.ready]).then(()=>setEngineReady(true)); },[]);
+  useEffect(()=>{ Promise.all([E.a.ready, E.b.ready, E.c.ready, E.d.ready]).then(()=>setEngineReady(true)); },[]);
 
   const [lib,setLib]=useState([]);
   const [q,setQ]=useState('');
   const [xfade,setXfade]=useState(0.5);
   const [volA,setVolA]=useState(0.8);
   const [volB,setVolB]=useState(0.8);
+  const [xfadeCD,setXfadeCD]=useState(0.5);
+  const [volC,setVolC]=useState(0.8);
+  const [volD,setVolD]=useState(0.8);
   const [masterVol,setMasterVol]=useState(0.85);
   const [dropping,setDropping]=useState(false);
   const [busy,setBusy]=useState('');
@@ -1611,9 +1631,24 @@ function App(){
   useEffect(()=>{ E.b.vol.gain.setTargetAtTime(volB,E.ctx.currentTime,0.01); },[volB]);
   useEffect(()=>{ E.master.gain.setTargetAtTime(masterVol,E.ctx.currentTime,0.01); },[masterVol]);
 
-  // --- continuous drift correction (see syncTick above) ---
+  // --- second crossfader: same constant-power curve, independent pair (C/D) ---
   useEffect(()=>{
-    const iv=setInterval(()=>{ syncTick(E.a,E.b); syncTick(E.b,E.a); }, SYNC_TICK_MS);
+    const t=E.ctx.currentTime;
+    E.c.xf.gain.setTargetAtTime(Math.cos(xfadeCD*Math.PI/2), t, 0.01);
+    E.d.xf.gain.setTargetAtTime(Math.cos((1-xfadeCD)*Math.PI/2), t, 0.01);
+  },[xfadeCD]);
+  useEffect(()=>{ E.c.vol.gain.setTargetAtTime(volC,E.ctx.currentTime,0.01); },[volC]);
+  useEffect(()=>{ E.d.vol.gain.setTargetAtTime(volD,E.ctx.currentTime,0.01); },[volD]);
+
+  // --- continuous drift correction (see syncTick above) ---
+  // SYNC only pairs within a row (A<->B, C<->D) — each DeckPanel's `other`
+  // prop below is fixed to its row partner, so that's the only pairing that
+  // can ever have syncEngaged set.
+  useEffect(()=>{
+    const iv=setInterval(()=>{
+      syncTick(E.a,E.b); syncTick(E.b,E.a);
+      syncTick(E.c,E.d); syncTick(E.d,E.c);
+    }, SYNC_TICK_MS);
     return ()=>clearInterval(iv);
   },[]);
 
@@ -1657,9 +1692,17 @@ function App(){
 
   const loadTo=async(track,which)=>{
     E.ctx.resume();
-    const d=which==='a'?E.a:E.b;
+    const d=E[which];
     await d.load(track.buffer, track.peaks, track.analysis, track);
     force();
+  };
+
+  // Double-click target for library rows: the first idle deck in A,B,C,D
+  // order, or A if all four are already playing (matches the old A/B-only
+  // behaviour when there are only two decks loaded).
+  const firstIdleDeck=()=>{
+    for(const w of ['a','b','c','d']) if(!E[w].playing) return w;
+    return 'a';
   };
 
   // Drop a track from the library list, releasing its decoded AudioBuffer for
@@ -1692,13 +1735,19 @@ function App(){
   useEffect(()=>{
     const onKey=(e)=>{
       if(e.target.tagName==='INPUT') return;
-      if(!E.a.link.node||!E.b.link.node) return;  // worklets not registered yet
+      if(!E.a.link.node||!E.b.link.node||!E.c.link.node||!E.d.link.node) return;  // worklets not registered yet
       const k=e.key.toLowerCase();
       E.ctx.resume();
       const map={
         q:()=>E.a.toggle(), p:()=>E.b.toggle(),
         w:()=>{E.a.toCue();}, o:()=>{E.b.toCue();},
         e:()=>{E.a.setCue();}, i:()=>{E.b.setCue();},
+        // C/D mirror the A/B layout one row down on the keyboard: A S D sit
+        // under Q W E, and L K J sit under P O I (right-to-left, mirroring
+        // B's P/O/I order) — no hotcues on these two, mouse/touch only.
+        a:()=>E.c.toggle(), l:()=>E.d.toggle(),
+        s:()=>{E.c.toCue();}, k:()=>{E.d.toCue();},
+        d:()=>{E.c.setCue();}, j:()=>{E.d.setCue();},
       };
       if(map[k]){ e.preventDefault(); map[k](); force(); return; }
       // Detect the digit via e.code, not e.key, so Shift+number still
@@ -1812,7 +1861,7 @@ function App(){
         <button className="btn" onClick={()=>fileInput.current.click()}>+ ADD TRACKS</button>
         <input ref={fileInput} type="file" accept="audio/*" multiple hidden
                onChange={e=>{ingest(e.target.files); e.target.value='';}}/>
-        <span className="hint">{busy || 'drag audio files anywhere · Q/P play · W/O cue · 1-4 & 7-0 hotcues · ←/→ crossfade · space slam'}</span>
+        <span className="hint">{busy || 'drag audio files anywhere · Q/P play A/B · W/O cue · A·S·D play/cue C · L·K·J play/cue D · 1-4 & 7-0 hotcues · ←/→ crossfade A/B · space slam'}</span>
         <div className="spacer"/>
         <div className="master-meter" ref={masterRef}>
           {Array.from({length:12},(_,i)=>
@@ -1827,54 +1876,100 @@ function App(){
           </button>}
       </div>
 
-      <div className="decks">
-        <DeckPanel deck={E.a} id="A" accent="var(--a)" other={E.b} bump={force} fxItems={fxItems}/>
+      <div className="deckrows">
+        <div className="decks">
+          <DeckPanel deck={E.a} id="A" accent="var(--a)" other={E.b} bump={force} fxItems={fxItems}/>
 
-        <div className="mixer">
-          <div className="mxlabel" style={{borderTop:'none',marginTop:0}}>MASTER</div>
-          <div style={{display:'flex',justifyContent:'center'}}>
-            <Knob label="GAIN" value={masterVol} min={0} max={1.2} color="#e6ebf2" size={46}
-                  onChange={setMasterVol} fmt={v=>Math.round(v*100)+'%'}/>
-          </div>
-
-          <div className="mxlabel">CHANNEL FADERS</div>
-          <div className="chan">
-            <div className="vslot">
-              <div className="vpair">
-                <Meter getLevel={()=>E.a.level()}/>
-                <input className="vol" type="range" min="0" max="1" step="0.01"
-                       value={volA} onChange={e=>setVolA(parseFloat(e.target.value))}/>
-              </div>
-              <div className="knoblbl" style={{color:'var(--a)'}}>A</div>
+          <div className="mixer">
+            <div className="mxlabel" style={{borderTop:'none',marginTop:0}}>MASTER</div>
+            <div style={{display:'flex',justifyContent:'center'}}>
+              <Knob label="GAIN" value={masterVol} min={0} max={1.2} color="#e6ebf2" size={46}
+                    onChange={setMasterVol} fmt={v=>Math.round(v*100)+'%'}/>
             </div>
-            <div className="vslot">
-              <div className="vpair">
-                <input className="vol" type="range" min="0" max="1" step="0.01"
-                       value={volB} onChange={e=>setVolB(parseFloat(e.target.value))}/>
-                <Meter getLevel={()=>E.b.level()}/>
+
+            <div className="mxlabel">CHANNEL FADERS</div>
+            <div className="chan">
+              <div className="vslot">
+                <div className="vpair">
+                  <Meter getLevel={()=>E.a.level()}/>
+                  <input className="vol" type="range" min="0" max="1" step="0.01"
+                         value={volA} onChange={e=>setVolA(parseFloat(e.target.value))}/>
+                </div>
+                <div className="knoblbl" style={{color:'var(--a)'}}>A</div>
               </div>
-              <div className="knoblbl" style={{color:'var(--b)'}}>B</div>
+              <div className="vslot">
+                <div className="vpair">
+                  <input className="vol" type="range" min="0" max="1" step="0.01"
+                         value={volB} onChange={e=>setVolB(parseFloat(e.target.value))}/>
+                  <Meter getLevel={()=>E.b.level()}/>
+                </div>
+                <div className="knoblbl" style={{color:'var(--b)'}}>B</div>
+              </div>
+            </div>
+
+            <div className="mxlabel">CROSSFADER</div>
+            <input className="xf" type="range" min="0" max="1" step="0.01"
+                   value={xfade} onChange={e=>setXfade(parseFloat(e.target.value))}/>
+            <div style={{display:'flex',justifyContent:'space-between',fontSize:9,color:'var(--dim)',fontWeight:700}}>
+              <span style={{color:'var(--a)'}}>A</span>
+              <button className="mini" onClick={()=>setXfade(0.5)}>CENTER</button>
+              <span style={{color:'var(--b)'}}>B</span>
+            </div>
+
+            <div className="mxlabel">BEAT MATCH</div>
+            <div style={{textAlign:'center',fontSize:11,color:'var(--dim)',fontVariantNumeric:'tabular-nums'}}>
+              {E.a.bpm&&E.b.bpm
+                ? <span>Δ {Math.abs(E.a.bpm-E.b.bpm).toFixed(1)} BPM</span>
+                : <span>load both decks</span>}
             </div>
           </div>
 
-          <div className="mxlabel">CROSSFADER</div>
-          <input className="xf" type="range" min="0" max="1" step="0.01"
-                 value={xfade} onChange={e=>setXfade(parseFloat(e.target.value))}/>
-          <div style={{display:'flex',justifyContent:'space-between',fontSize:9,color:'var(--dim)',fontWeight:700}}>
-            <span style={{color:'var(--a)'}}>A</span>
-            <button className="mini" onClick={()=>setXfade(0.5)}>CENTER</button>
-            <span style={{color:'var(--b)'}}>B</span>
-          </div>
-
-          <div className="mxlabel">BEAT MATCH</div>
-          <div style={{textAlign:'center',fontSize:11,color:'var(--dim)',fontVariantNumeric:'tabular-nums'}}>
-            {E.a.bpm&&E.b.bpm
-              ? <span>Δ {Math.abs(E.a.bpm-E.b.bpm).toFixed(1)} BPM</span>
-              : <span>load both decks</span>}
-          </div>
+          <DeckPanel deck={E.b} id="B" accent="var(--b)" other={E.a} bump={force} fxItems={fxItems}/>
         </div>
 
-        <DeckPanel deck={E.b} id="B" accent="var(--b)" other={E.a} bump={force} fxItems={fxItems}/>
+        <div className="decks">
+          <DeckPanel deck={E.c} id="C" accent="var(--c)" other={E.d} bump={force} fxItems={fxItems}/>
+
+          <div className="mixer">
+            <div className="mxlabel" style={{borderTop:'none',marginTop:0}}>CHANNEL FADERS</div>
+            <div className="chan">
+              <div className="vslot">
+                <div className="vpair">
+                  <Meter getLevel={()=>E.c.level()}/>
+                  <input className="vol" type="range" min="0" max="1" step="0.01"
+                         value={volC} onChange={e=>setVolC(parseFloat(e.target.value))}/>
+                </div>
+                <div className="knoblbl" style={{color:'var(--c)'}}>C</div>
+              </div>
+              <div className="vslot">
+                <div className="vpair">
+                  <input className="vol" type="range" min="0" max="1" step="0.01"
+                         value={volD} onChange={e=>setVolD(parseFloat(e.target.value))}/>
+                  <Meter getLevel={()=>E.d.level()}/>
+                </div>
+                <div className="knoblbl" style={{color:'var(--d)'}}>D</div>
+              </div>
+            </div>
+
+            <div className="mxlabel">CROSSFADER</div>
+            <input className="xf" type="range" min="0" max="1" step="0.01"
+                   value={xfadeCD} onChange={e=>setXfadeCD(parseFloat(e.target.value))}/>
+            <div style={{display:'flex',justifyContent:'space-between',fontSize:9,color:'var(--dim)',fontWeight:700}}>
+              <span style={{color:'var(--c)'}}>C</span>
+              <button className="mini" onClick={()=>setXfadeCD(0.5)}>CENTER</button>
+              <span style={{color:'var(--d)'}}>D</span>
+            </div>
+
+            <div className="mxlabel">BEAT MATCH</div>
+            <div style={{textAlign:'center',fontSize:11,color:'var(--dim)',fontVariantNumeric:'tabular-nums'}}>
+              {E.c.bpm&&E.d.bpm
+                ? <span>Δ {Math.abs(E.c.bpm-E.d.bpm).toFixed(1)} BPM</span>
+                : <span>load both decks</span>}
+            </div>
+          </div>
+
+          <DeckPanel deck={E.d} id="D" accent="var(--d)" other={E.c} bump={force} fxItems={fxItems}/>
+        </div>
       </div>
 
       <div className="lib">
@@ -1900,7 +1995,7 @@ function App(){
           </div>}
           {shown.map(t=>(
             <div key={t.id} className="lrow"
-                 onDoubleClick={()=>loadTo(t, E.a.playing && !E.b.playing ? 'b' : 'a')}>
+                 onDoubleClick={()=>loadTo(t, firstIdleDeck())}>
               <div className="nm"><b>{t.title}</b> <span style={{color:'var(--dim)'}}>— {t.artist}</span></div>
               <select className="tagsel" value={t.tag||''}
                       onClick={e=>e.stopPropagation()}
@@ -1916,10 +2011,15 @@ function App(){
               <div className="mu">{fmtTime(t.duration).split('.')[0]}</div>
               <div className="mu">{Math.round(t.file.size/1048576*10)/10} MB</div>
               <div style={{display:'flex',gap:6}}>
-                <button className="mini" style={{color:'var(--a)',borderColor:'#1d3d47'}}
-                        onClick={()=>loadTo(t,'a')}>→ A</button>
-                <button className="mini" style={{color:'var(--b)',borderColor:'#4a2e18'}}
-                        onClick={()=>loadTo(t,'b')}>→ B</button>
+                <select className="tagsel" style={{width:62,flex:'none'}}
+                        value="" onClick={e=>e.stopPropagation()}
+                        onChange={e=>{ if(e.target.value) loadTo(t,e.target.value); }}>
+                  <option value="">→ deck</option>
+                  <option value="a">A</option>
+                  <option value="b">B</option>
+                  <option value="c">C</option>
+                  <option value="d">D</option>
+                </select>
                 <button className="mini" title="remove from library"
                         onClick={(e)=>{e.stopPropagation();removeTrack(t.id);}}>✕</button>
               </div>
