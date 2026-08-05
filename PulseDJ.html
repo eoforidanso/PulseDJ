@@ -200,6 +200,19 @@
   .drop{position:fixed;inset:0;background:rgba(0,229,255,.08);border:3px dashed var(--a);
     display:grid;place-items:center;font-size:20px;font-weight:700;letter-spacing:2px;z-index:99;
     pointer-events:none}
+
+  /* MIDI mapping panel */
+  .midibackdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;
+    display:flex;align-items:center;justify-content:center;padding:20px}
+  .midipanel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    width:min(560px,100%);max-height:80vh;display:flex;flex-direction:column;
+    box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  .midihead{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}
+  .midihead h3{font-size:12px;letter-spacing:1.6px;color:var(--txt);font-weight:700}
+  .midilist{overflow-y:auto;padding:6px 14px 14px}
+  .midirow{display:flex;align-items:center;gap:8px;padding:4px 0}
+  .midilbl{flex:1;font-size:11.5px}
+  .midival{font-size:10px;color:var(--dim);font-variant-numeric:tabular-nums;min-width:90px;text-align:right}
   ::-webkit-scrollbar{width:9px;height:9px}
   ::-webkit-scrollbar-thumb{background:#232936;border-radius:5px}
   ::-webkit-scrollbar-track{background:transparent}
@@ -279,7 +292,7 @@
 </script>
 
 <script type="text/babel" data-presets="react-classic">
-const {useState,useRef,useEffect,useCallback,useMemo} = React;
+const {useState,useRef,useEffect,useCallback,useMemo,forwardRef,useImperativeHandle} = React;
 
 // Populated by the dynamic import() at the bottom of this script before
 // App() ever mounts — EngineDeck and DeckPanel only reference these once
@@ -981,6 +994,46 @@ function Meter({getLevel}){
 const CUE_COLORS=['#ff4d4d','#ffd400','#3ddc84','#00e5ff','#c77dff','#ff7a29','#4d7cff','#ff4dc4'];
 const PITCH_RANGE=16;   // percent, each way — the classic ±16% turntable range
 
+/* ============================================================
+   MIDI CONTROLLER MAPPING
+   ------------------------------------------------------------
+   Generic "MIDI learn" rather than a hardcoded controller profile: any
+   class-compliant MIDI device works, the user just clicks LEARN next to a
+   control and moves the physical one. Bindings persist in localStorage so
+   they survive a reload without re-mapping.
+   ============================================================ */
+const MIDI_MAP_KEY='pulsedj.midimap.v1';
+function loadMidiMap(){
+  try{ return JSON.parse(localStorage.getItem(MIDI_MAP_KEY)) || {}; }
+  catch{ return {}; }
+}
+function saveMidiMap(map){
+  try{ localStorage.setItem(MIDI_MAP_KEY, JSON.stringify(map)); }catch{}
+}
+// 'trigger' controls bind to a note (press = fire, e.g. play/cue/sync/hotcue);
+// 'fader' controls bind to a CC (absolute 0-127 position, e.g. volume/pitch/EQ).
+const MIDI_DECKS=['a','b','c','d'];
+const MIDI_CONTROLS=[
+  ...MIDI_DECKS.flatMap(d=>[
+    {id:`${d}.play`,   label:`Deck ${d.toUpperCase()} · Play/Pause`, kind:'trigger'},
+    {id:`${d}.cue`,    label:`Deck ${d.toUpperCase()} · Cue (hold)`, kind:'trigger'},
+    {id:`${d}.sync`,   label:`Deck ${d.toUpperCase()} · Sync`,       kind:'trigger'},
+    {id:`${d}.hc1`,    label:`Deck ${d.toUpperCase()} · Hotcue 1`,   kind:'trigger'},
+    {id:`${d}.hc2`,    label:`Deck ${d.toUpperCase()} · Hotcue 2`,   kind:'trigger'},
+    {id:`${d}.hc3`,    label:`Deck ${d.toUpperCase()} · Hotcue 3`,   kind:'trigger'},
+    {id:`${d}.hc4`,    label:`Deck ${d.toUpperCase()} · Hotcue 4`,   kind:'trigger'},
+    {id:`${d}.vol`,    label:`Deck ${d.toUpperCase()} · Volume`,     kind:'fader'},
+    {id:`${d}.pitch`,  label:`Deck ${d.toUpperCase()} · Pitch`,      kind:'fader'},
+    {id:`${d}.low`,    label:`Deck ${d.toUpperCase()} · EQ Low`,     kind:'fader'},
+    {id:`${d}.mid`,    label:`Deck ${d.toUpperCase()} · EQ Mid`,     kind:'fader'},
+    {id:`${d}.high`,   label:`Deck ${d.toUpperCase()} · EQ High`,    kind:'fader'},
+    {id:`${d}.filter`, label:`Deck ${d.toUpperCase()} · Filter`,     kind:'fader'},
+  ]),
+  {id:'xfab',   label:'Crossfader A / B', kind:'fader'},
+  {id:'xfcd',   label:'Crossfader C / D', kind:'fader'},
+  {id:'master', label:'Master Gain',      kind:'fader'},
+];
+
 // FX-file categories used both to tag library rows and to populate each deck's
 // FX slot. Colours double as the row-pill / filter-chip accent per tag.
 const FX_TAGS=['Sweep','Riser','Impact','Stinger'];
@@ -1183,7 +1236,7 @@ const fmtTime=(s)=>{
   return `${m}:${String(r).padStart(2,'0')}.${String(c).padStart(2,'0')}`;
 };
 
-function DeckPanel({deck, id, accent, other, bump, fxItems}){
+const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fxItems}, midiRef){
   const [,force]=useState(0);
   const [pitch,setPitch]=useState(0);           // percent
   const [eq,setEq]=useState({low:0,mid:0,high:0});
@@ -1307,6 +1360,17 @@ function DeckPanel({deck, id, accent, other, bump, fxItems}){
       deck.hpf.frequency.setTargetAtTime(20,t,0.01);
     }
   };
+
+  // Exposes the same setters the on-screen pitch/EQ/filter/sync controls use,
+  // so a MIDI-mapped physical fader/button (driven from App(), which has no
+  // access to this component's local state) moves the on-screen knob in step
+  // instead of the two silently drifting apart.
+  useImperativeHandle(midiRef, ()=>({
+    midiPitch: applyPitch,
+    midiEq: setEqBand,
+    midiFilter: setFilterKnob,
+    midiSync: doSync,
+  }));
 
   const setFxAmount=(v)=>{
     setFx(f=>({...f,amount:v}));
@@ -1537,6 +1601,48 @@ function DeckPanel({deck, id, accent, other, bump, fxItems}){
       </div>
     </div>
   );
+});
+
+/* ============================================================
+   MIDI PANEL — mapping UI (list of controls, LEARN/clear per row)
+   ============================================================ */
+function MidiPanel({devices, map, learn, onLearn, onClear, onClearAll, onClose}){
+  const fmtBinding=(b)=> b ? `CH${b.channel+1} ${b.type==='cc'?'CC':'NOTE'} ${b.number}` : '—';
+  const groups=[['A','a'],['B','b'],['C','c'],['D','d'],['MASTER','']];
+  return (
+    <div className="midibackdrop" onClick={onClose}>
+      <div className="midipanel" onClick={e=>e.stopPropagation()}>
+        <div className="midihead">
+          <h3>MIDI MAPPING</h3>
+          <span className="hint">
+            {devices.length ? `connected: ${devices.join(', ')}` : 'no MIDI devices detected — connect a controller'}
+          </span>
+          <div className="spacer"/>
+          <button className="mini" onClick={onClearAll}>CLEAR ALL</button>
+          <button className="btn" onClick={onClose}>CLOSE</button>
+        </div>
+        <div className="midilist">
+          {groups.map(([label,d])=>(
+            <div key={label}>
+              <div className="mxlabel" style={{textAlign:'left',marginTop:10}}>{label}</div>
+              {MIDI_CONTROLS.filter(c=> d ? c.id.startsWith(d+'.') : !c.id.includes('.')).map(c=>(
+                <div key={c.id} className="midirow">
+                  <span className="midilbl">{c.label}</span>
+                  <span className="midival">{learn===c.id ? 'listening…' : fmtBinding(map[c.id])}</span>
+                  <button className={'mini'+(learn===c.id?' on':'')}
+                          style={learn===c.id?{background:'var(--yel)',color:'#000',borderColor:'var(--yel)'}:null}
+                          onClick={()=>onLearn(learn===c.id?null:c.id)}>
+                    {learn===c.id?'CANCEL':'LEARN'}
+                  </button>
+                  <button className="mini" disabled={!map[c.id]} onClick={()=>onClear(c.id)}>✕</button>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /* ============================================================
@@ -1589,6 +1695,97 @@ function App(){
   const recRef=useRef(null);
   const [,bump]=useState(0);
   const force=()=>bump(x=>x+1);
+
+  // --- deck imperative handles (MIDI-driven pitch/EQ/filter/sync — see
+  // DeckPanel's useImperativeHandle) ---
+  const refA=useRef(null), refB=useRef(null), refC=useRef(null), refD=useRef(null);
+  const deckRefs={a:refA,b:refB,c:refC,d:refD};
+
+  // --- MIDI controller mapping ---
+  const [midiMap,setMidiMapState]=useState(loadMidiMap);
+  const [midiLearn,setMidiLearn]=useState(null);   // control id currently listening, or null
+  const [midiOpen,setMidiOpen]=useState(false);
+  const [midiDevices,setMidiDevices]=useState([]);
+  const midiMapRef=useRef(midiMap); useEffect(()=>{ midiMapRef.current=midiMap; },[midiMap]);
+  const midiLearnRef=useRef(midiLearn); useEffect(()=>{ midiLearnRef.current=midiLearn; },[midiLearn]);
+  const setMidiMap=(m)=>{ setMidiMapState(m); saveMidiMap(m); };
+
+  const volSetters={a:setVolA,b:setVolB,c:setVolC,d:setVolD};
+  const dispatchFader=(id,v01)=>{
+    if(id==='xfab'){ setXfade(v01); return; }
+    if(id==='xfcd'){ setXfadeCD(v01); return; }
+    if(id==='master'){ setMasterVol(v01*1.2); return; }
+    const [d,ctrl]=id.split('.');
+    if(!E[d]) return;
+    if(ctrl==='vol'){ volSetters[d](v01); return; }
+    if(ctrl==='pitch'){ deckRefs[d].current?.midiPitch((v01*2-1)*PITCH_RANGE); return; }
+    if(ctrl==='low'||ctrl==='mid'||ctrl==='high'){ deckRefs[d].current?.midiEq(ctrl, v01*38-26); return; }
+    if(ctrl==='filter'){ deckRefs[d].current?.midiFilter(v01*2-1); return; }
+  };
+  const dispatchNote=(id,pressed)=>{
+    const [d,ctrl]=id.split('.');
+    const deck=E[d];
+    if(!deck) return;
+    if(ctrl==='play'){ if(pressed){ deck.toggle(); force(); } return; }
+    if(ctrl==='cue'){
+      if(pressed){ if(!deck.playing) deck.setCue(); deck.toCue(); deck.play(); }
+      else { deck.pause(); deck.toCue(); }
+      force(); return;
+    }
+    if(ctrl==='sync'){ if(pressed) deckRefs[d].current?.midiSync(); return; }
+    if(ctrl && ctrl.startsWith('hc')){
+      if(pressed){
+        const i=+ctrl.slice(2)-1;
+        if(deck.hotcues[i]==null) deck.hotcues[i]=deck.position();
+        else deck.jumpTo(deck.hotcues[i]);
+        force();
+      }
+      return;
+    }
+  };
+
+  // Web MIDI: connect to every available input, forward messages either into
+  // the learn-capture path (armed by clicking LEARN in the panel) or through
+  // the saved map to dispatchFader/dispatchNote. Runs once — freshness for
+  // midiMap/midiLearn comes from the refs above, not the closure, since those
+  // change far more often than this effect should re-subscribe.
+  useEffect(()=>{
+    if(!navigator.requestMIDIAccess) return;
+    let access=null, cancelled=false;
+    const onMessage=(e)=>{
+      const [status,d1,d2]=e.data;
+      const type=status & 0xF0, channel=status & 0x0F;
+      const learn=midiLearnRef.current;
+      if(learn){
+        const ctrl=MIDI_CONTROLS.find(c=>c.id===learn);
+        if(!ctrl) return;
+        if(ctrl.kind==='fader' && type===0xB0){
+          setMidiMap({...midiMapRef.current,[learn]:{type:'cc',channel,number:d1}});
+          setMidiLearn(null);
+        } else if(ctrl.kind==='trigger' && type===0x90 && d2>0){
+          setMidiMap({...midiMapRef.current,[learn]:{type:'note',channel,number:d1}});
+          setMidiLearn(null);
+        }
+        return;
+      }
+      const map=midiMapRef.current;
+      for(const id in map){
+        const b=map[id];
+        if(b.channel!==channel || b.number!==d1) continue;
+        if(b.type==='cc' && type===0xB0) dispatchFader(id, d2/127);
+        else if(b.type==='note' && (type===0x90||type===0x80)) dispatchNote(id, type===0x90 && d2>0);
+      }
+    };
+    const attach=(a)=>{
+      if(cancelled) return;
+      setMidiDevices([...a.inputs.values()].map(i=>i.name||i.id));
+      for(const input of a.inputs.values()) input.onmidimessage=onMessage;
+    };
+    navigator.requestMIDIAccess().then(a=>{
+      access=a; attach(a); a.onstatechange=()=>attach(a);
+    }).catch(err=>console.warn('MIDI unavailable', err));
+    return ()=>{ cancelled=true; if(access) for(const input of access.inputs.values()) input.onmidimessage=null; };
+  },[]);
 
   // --- PWA install ---
   // Chromium fires beforeinstallprompt when the app is installable; we stash
@@ -1870,6 +2067,16 @@ function App(){
         <button className={'btn rec'+(recording?' on':'')} onClick={toggleRec}>
           {recording?'■ STOP REC':'● REC MIX'}
         </button>
+        <button className={'btn'+(midiDevices.length?' on':'')} onClick={()=>setMidiOpen(true)}
+                title={midiDevices.length?`connected: ${midiDevices.join(', ')}`:'map a MIDI controller'}>
+          🎛 MIDI{midiDevices.length?` (${midiDevices.length})`:''}
+        </button>
+        {midiOpen &&
+          <MidiPanel devices={midiDevices} map={midiMap} learn={midiLearn}
+                     onLearn={setMidiLearn}
+                     onClear={(id)=>{ const m={...midiMap}; delete m[id]; setMidiMap(m); }}
+                     onClearAll={()=>setMidiMap({})}
+                     onClose={()=>{ setMidiOpen(false); setMidiLearn(null); }}/>}
         {!installed &&
           <button className="install" onClick={doInstall} title="Install PULSE DJ as an app">
             {canInstall?'⬇ INSTALL':'📱 INSTALL'}
@@ -1878,7 +2085,7 @@ function App(){
 
       <div className="deckrows">
         <div className="decks">
-          <DeckPanel deck={E.a} id="A" accent="var(--a)" other={E.b} bump={force} fxItems={fxItems}/>
+          <DeckPanel ref={refA} deck={E.a} id="A" accent="var(--a)" other={E.b} bump={force} fxItems={fxItems}/>
 
           <div className="mixer">
             <div className="mxlabel" style={{borderTop:'none',marginTop:0}}>MASTER</div>
@@ -1924,11 +2131,11 @@ function App(){
             </div>
           </div>
 
-          <DeckPanel deck={E.b} id="B" accent="var(--b)" other={E.a} bump={force} fxItems={fxItems}/>
+          <DeckPanel ref={refB} deck={E.b} id="B" accent="var(--b)" other={E.a} bump={force} fxItems={fxItems}/>
         </div>
 
         <div className="decks">
-          <DeckPanel deck={E.c} id="C" accent="var(--c)" other={E.d} bump={force} fxItems={fxItems}/>
+          <DeckPanel ref={refC} deck={E.c} id="C" accent="var(--c)" other={E.d} bump={force} fxItems={fxItems}/>
 
           <div className="mixer">
             <div className="mxlabel" style={{borderTop:'none',marginTop:0}}>CHANNEL FADERS</div>
@@ -1968,7 +2175,7 @@ function App(){
             </div>
           </div>
 
-          <DeckPanel deck={E.d} id="D" accent="var(--d)" other={E.c} bump={force} fxItems={fxItems}/>
+          <DeckPanel ref={refD} deck={E.d} id="D" accent="var(--d)" other={E.c} bump={force} fxItems={fxItems}/>
         </div>
       </div>
 
