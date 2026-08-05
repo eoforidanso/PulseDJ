@@ -171,7 +171,7 @@
     background:linear-gradient(#414b60,#232936);border:1px solid #545f75;margin-top:-11px;box-shadow:0 1px 3px #000}
 
   /* library */
-  .lib{flex:0 0 auto;height:200px;background:var(--panel);border-top:1px solid var(--line);
+  .lib{flex:0 0 auto;height:228px;background:var(--panel);border-top:1px solid var(--line);
     display:flex;flex-direction:column}
   .libhead{display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid var(--line)}
   .libhead h3{font-size:11px;letter-spacing:1.6px;color:var(--dim);font-weight:700}
@@ -182,6 +182,12 @@
      the FX tag chips do — a crate is just a saved set of library track ids */
   .cratebar{display:flex;align-items:center;gap:6px;padding:5px 12px;
     border-bottom:1px solid var(--line);flex-wrap:wrap}
+  /* filter bar: BPM range + detected-key filter, same row language as cratebar */
+  .filterbar{display:flex;align-items:center;gap:6px;padding:5px 12px;
+    border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .numin{background:#05070a;border:1px solid var(--line);border-radius:5px;color:var(--txt);
+    padding:4px 6px;font-size:11px;width:56px;outline:none}
+  .numin:focus{border-color:#3a4356}
   .liblist{flex:1;overflow-y:auto}
   .lrow{display:grid;grid-template-columns:1fr 88px 45px 90px 60px 60px 190px;gap:8px;align-items:center;
     padding:6px 12px;border-bottom:1px solid #14181f;font-size:11.5px;cursor:grab}
@@ -1935,6 +1941,18 @@ function App(){
   const fxItems=useMemo(()=>lib.filter(t=>t.tag),[lib]);
   const [tagFilter,setTagFilter]=useState('');   // '' = show all; else a single FX tag
 
+  // --- library filters: BPM range + detected key ---
+  const [bpmMin,setBpmMin]=useState('');
+  const [bpmMax,setBpmMax]=useState('');
+  const [keyFilter,setKeyFilter]=useState('');
+  const libKeys=useMemo(()=>{
+    const s=new Set();
+    for(const t of lib) if(t.key) s.add(`${t.key} ${t.mode?.[0].toUpperCase()||''}`);
+    return [...s].sort();
+  },[lib]);
+  const filtersActive = bpmMin!=='' || bpmMax!=='' || keyFilter!=='';
+  const clearFilters=()=>{ setBpmMin(''); setBpmMax(''); setKeyFilter(''); };
+
   // --- crates: named, persisted subsets of the library (by track id) ---
   const [crates,setCratesState]=useState(loadCrates);
   const [activeCrate,setActiveCrate]=useState(null);   // crate id, or null = all tracks
@@ -2093,13 +2111,17 @@ function App(){
   const shown=useMemo(()=>{
     const s=q.trim().toLowerCase();
     const crate=activeCrate ? crates.find(c=>c.id===activeCrate) : null;
+    const lo=bpmMin===''?null:parseFloat(bpmMin), hi=bpmMax===''?null:parseFloat(bpmMax);
     return lib.filter(t=>{
       if(crate && !crate.trackIds.includes(t.id)) return false;
       if(tagFilter && t.tag!==tagFilter) return false;
+      if(lo!=null && t.bpm<lo) return false;
+      if(hi!=null && t.bpm>hi) return false;
+      if(keyFilter && `${t.key} ${t.mode?.[0].toUpperCase()||''}`!==keyFilter) return false;
       if(s && !(t.title+' '+t.artist).toLowerCase().includes(s)) return false;
       return true;
     });
-  },[lib,q,tagFilter,activeCrate,crates]);
+  },[lib,q,tagFilter,activeCrate,crates,bpmMin,bpmMax,keyFilter]);
 
   const fileInput=useRef(null);
 
@@ -2269,6 +2291,21 @@ function App(){
           ))}
           <button className="mini" onClick={newCrate}>+ NEW CRATE</button>
           {activeCrate && <button className="mini" onClick={()=>deleteCrate(activeCrate)}>DELETE CRATE</button>}
+        </div>
+        <div className="filterbar">
+          <span className="hint" style={{flex:'none'}}>BPM</span>
+          <input className="numin" type="number" placeholder="min" value={bpmMin}
+                 onChange={e=>setBpmMin(e.target.value)}/>
+          <span className="hint" style={{flex:'none'}}>–</span>
+          <input className="numin" type="number" placeholder="max" value={bpmMax}
+                 onChange={e=>setBpmMax(e.target.value)}/>
+          <span className="hint" style={{flex:'none',marginLeft:6}}>KEY</span>
+          <select className="tagsel" style={{width:64,flex:'none'}}
+                  value={keyFilter} onChange={e=>setKeyFilter(e.target.value)}>
+            <option value="">all</option>
+            {libKeys.map(k=><option key={k} value={k}>{k}</option>)}
+          </select>
+          {filtersActive && <button className="mini" onClick={clearFilters}>CLEAR FILTERS</button>}
         </div>
         <div className="liblist">
           {shown.length===0 && <div className="empty">
