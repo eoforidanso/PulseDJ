@@ -926,9 +926,16 @@ function syncTick(leader, follower){
    UI PRIMITIVES
    ============================================================ */
 
+// Unique per-instance SVG def ids — <defs> ids must not collide across the
+// many Knobs on screen at once, or every knob ends up rendering whichever
+// gradient/filter was defined last.
+let _knobDefSeq=0;
+
 function Knob({value,min,max,onChange,label,fmt,color,size=38,center=false}){
   const ref=useRef(null);
   const drag=useRef(null);
+  const defId=useRef(++_knobDefSeq).current;
+  const gradId=`kg${defId}`, blurId=`kb${defId}`;
 
   const down=(e)=>{
     e.preventDefault();
@@ -958,18 +965,59 @@ function Knob({value,min,max,onChange,label,fmt,color,size=38,center=false}){
   };
   const [x0,y0]=pol(a0,r-4), [x1,y1]=pol(a1,r-4);
   const large=(a1-a0)>180?1:0;
-  const [mx,my]=pol(ang,r-9);
+
+  // Knob body — modern hardware-controller look: a dark base disc lit by a
+  // radial "gel" gradient offset toward the upper-left (as if lit from that
+  // corner), a soft outer shadow ring for separation from the panel behind
+  // it, a blurred specular highlight arc at ~315° reinforcing the same light
+  // source, and a short inset notch (rather than a full spoke) marking the
+  // current value — the value itself is still shown by the colour-accented
+  // arc on the outer track, unchanged from before.
+  const bodyR=Math.max(3, r-9);
+  const [sx0,sy0]=pol(295,Math.max(1,bodyR-3));
+  const [sx1,sy1]=pol(335,Math.max(1,bodyR-3));
+  // A short mark near the rim, not a needle to the center — scales with the
+  // body instead of a fixed px length so it stays proportional from the
+  // 26px Q knob up to the 46px master gain knob.
+  const notchOuter=bodyR-1, notchInner=bodyR-1-bodyR*0.35;
+  const [nx0,ny0]=pol(ang,Math.max(1,notchOuter));
+  const [nx1,ny1]=pol(ang,Math.max(0,notchInner));
 
   return (
     <div className="knobwrap">
       <svg ref={ref} width={size} height={size} onPointerDown={down}
-           style={{cursor:'ns-resize',touchAction:'none'}} onDoubleClick={()=>onChange(center?(min+max)/2:max)}>
+           style={{cursor:'ns-resize',touchAction:'none',overflow:'visible'}}
+           onDoubleClick={()=>onChange(center?(min+max)/2:max)}>
+        <defs>
+          <radialGradient id={gradId} cx="38%" cy="32%" r="75%">
+            <stop offset="0%" stopColor="rgba(255,255,255,0.08)"/>
+            <stop offset="55%" stopColor="rgba(255,255,255,0.02)"/>
+            <stop offset="100%" stopColor="rgba(0,0,0,0.4)"/>
+          </radialGradient>
+          <filter id={blurId} x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="0.6"/>
+          </filter>
+        </defs>
+
         <circle cx={r} cy={r} r={r-4} fill="none" stroke="#232936" strokeWidth="3"/>
         {Math.abs(a1-a0)>0.5 &&
           <path d={`M ${x0} ${y0} A ${r-4} ${r-4} 0 ${large} 1 ${x1} ${y1}`}
                 fill="none" stroke={color} strokeWidth="3" strokeLinecap="round"/>}
-        <circle cx={r} cy={r} r={r-10} fill="#161a22" stroke="#2b3242"/>
-        <line x1={r} y1={r} x2={mx} y2={my} stroke={color} strokeWidth="2" strokeLinecap="round"/>
+
+        {/* shadow ring, 1px outside the knob body */}
+        <circle cx={r} cy={r} r={bodyR+1} fill="none" stroke="rgba(0,0,0,0.6)" strokeWidth="1"/>
+        {/* base disc + lighting gradient */}
+        <circle cx={r} cy={r} r={bodyR} fill="#1a1a1a" stroke="#000000" strokeWidth="1.5"/>
+        <circle cx={r} cy={r} r={bodyR} fill={`url(#${gradId})`}/>
+        {/* specular highlight */}
+        <path d={`M ${sx0} ${sy0} A ${Math.max(1,bodyR-3)} ${Math.max(1,bodyR-3)} 0 0 1 ${sx1} ${sy1}`}
+              fill="none" stroke="#fff" strokeOpacity="0.25" strokeWidth="1"
+              strokeLinecap="round" filter={`url(#${blurId})`}/>
+        {/* indicator notch, with a faint offset shadow for an inset feel */}
+        <line x1={nx0+0.4} y1={ny0+0.4} x2={nx1+0.4} y2={ny1+0.4}
+              stroke="rgba(0,0,0,0.5)" strokeWidth="2" strokeLinecap="round"/>
+        <line x1={nx0} y1={ny0} x2={nx1} y2={ny1}
+              stroke="#e0e0e0" strokeWidth="2" strokeLinecap="round"/>
       </svg>
       <div className="knoblbl">{label}</div>
       {fmt && <div className="knobval">{fmt(value)}</div>}
