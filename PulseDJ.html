@@ -57,6 +57,7 @@
   .btn:hover{color:var(--txt);border-color:#3a4356}
   .btn.on{background:var(--a);color:#000;border-color:var(--a)}
   .btn.rec.on{background:var(--red);color:#fff;border-color:var(--red)}
+  .btn.auto.on{background:var(--grn);color:#000;border-color:var(--grn)}
   .master-meter{display:flex;gap:2px;align-items:flex-end;height:16px}
 
   /* ---- decks row ----
@@ -525,6 +526,92 @@ function detectKey(buffer){
 }
 
 /* ============================================================
+   AUTO-DJ TRACK SELECTION
+   ------------------------------------------------------------
+   Scores candidate tracks against the one currently playing, using the
+   same two things a human DJ picks on: will it beat-match, and will it
+   sound harmonically right on top. Deliberately not a black box — the
+   score is a plain weighted sum of a tempo term and a Camelot-wheel key
+   term, so the reason a track got chosen is inspectable.
+   ============================================================ */
+
+// Camelot wheel positions. Harmonic mixing works on adjacent wheel slots:
+// same number (relative major/minor swap), or ±1 with the same letter.
+const CAMELOT={
+  'Ab minor':'1A','G# minor':'1A','B major':'1B',
+  'Eb minor':'2A','D# minor':'2A','F# major':'2B','Gb major':'2B',
+  'Bb minor':'3A','A# minor':'3A','Db major':'3B','C# major':'3B',
+  'F minor':'4A','Ab major':'4B','G# major':'4B',
+  'C minor':'5A','Eb major':'5B','D# major':'5B',
+  'G minor':'6A','Bb major':'6B','A# major':'6B',
+  'D minor':'7A','F major':'7B',
+  'A minor':'8A','C major':'8B',
+  'E minor':'9A','G major':'9B',
+  'B minor':'10A','D major':'10B',
+  'F# minor':'11A','Gb minor':'11A','A major':'11B',
+  'Db minor':'12A','C# minor':'12A','E major':'12B',
+};
+function camelotOf(track){
+  if(!track || !track.key || !track.mode) return null;
+  return CAMELOT[`${track.key} ${track.mode}`] || null;
+}
+
+// 1.0 = same key, 0.85 = relative major/minor, 0.8 = one step around the
+// wheel, 0.25 = no harmonic relationship (still mixable, just not "in key").
+// Unknown key on either side scores neutral rather than penalising — a
+// missing analysis shouldn't rank a track below a genuine clash.
+function keyScore(a,b){
+  const ca=camelotOf(a), cb=camelotOf(b);
+  if(!ca || !cb) return 0.5;
+  if(ca===cb) return 1.0;
+  const na=parseInt(ca), la=ca.slice(-1);
+  const nb=parseInt(cb), lb=cb.slice(-1);
+  if(na===nb && la!==lb) return 0.85;
+  const step=Math.min((na-nb+12)%12, (nb-na+12)%12);
+  if(step===1 && la===lb) return 0.8;
+  return 0.25;
+}
+
+// Tempo term: 1.0 for an exact match, falling to 0 at the edge of the
+// pitch fader's reach. Octave folds count — a 140 BPM track over a 70 BPM
+// one is a perfectly good double-time mix, so fold before measuring.
+function bpmScore(fromBpm,toBpm){
+  if(!fromBpm || !toBpm) return 0.5;
+  let best=Infinity;
+  for(const cand of [toBpm, toBpm*2, toBpm/2]){
+    const pct=Math.abs(cand-fromBpm)/fromBpm*100;
+    if(pct<best) best=pct;
+  }
+  if(best>PITCH_RANGE) return 0;   // unreachable without pitching past ±16%
+  return 1-(best/PITCH_RANGE);
+}
+
+// Weighted toward tempo: an out-of-range tempo can't be mixed at all,
+// whereas a key clash is merely less pleasing.
+function trackScore(current,cand){
+  return 0.6*bpmScore(current.bpm,cand.bpm) + 0.4*keyScore(current,cand);
+}
+
+// Best next track from `pool`, excluding anything already played this
+// session or currently sitting on a deck. Returns null when nothing is
+// mixable (e.g. every remaining track is outside pitch range).
+//
+// Tempo is a hard gate, not just a weighted term: a track SYNC physically
+// cannot reach (bpmScore 0 — more than ±16% away even after octave folds)
+// is unmixable no matter how well its key fits, and the weighted sum alone
+// would still float it to the top on the strength of the key term.
+function pickNextTrack(current, pool, excludeIds){
+  let best=null, bestScore=-Infinity;
+  for(const t of pool){
+    if(excludeIds.has(t.id)) continue;
+    if(current && bpmScore(current.bpm,t.bpm)<=0) continue;
+    const s=current ? trackScore(current,t) : 0.5;
+    if(s>bestScore){ bestScore=s; best=t; }
+  }
+  return best ? {track:best, score:bestScore} : null;
+}
+
+/* ============================================================
    AUDIO ENGINE
    ============================================================ */
 
@@ -684,6 +771,20 @@ class EngineDeck {
     for(let c=0;c<buffer.numberOfChannels;c++) channels.push(buffer.getChannelData(c).slice());
     await this.link.load(channels, {bpm:this.baseBpm, beatOffset:this.beatOffset});
     this.link.loopOff();
+    // Rewind to the top. Loading new samples doesn't move the worklet's
+    // playhead, so a deck whose previous track ran to the end would start the
+    // NEW track already finished — press play and nothing happens. Only shows
+    // up once a deck has been used twice in a session, which is why it went
+    // unnoticed until the auto-mixer started cycling decks continuously.
+    this.link.seek(0);
+    // ...and reflect that in the cached report the position estimate reads
+    // from. seek() only re-anchors the projection used by the beat-grid maths;
+    // estimatedPosition() returns link.last.playhead, which keeps the OLD
+    // track's position until the worklet's next report ~23ms later. Anything
+    // reading position() in that window — notably SYNC, which auto-play fires
+    // immediately after loading — would see the stale value and seek the deck
+    // straight back to it.
+    this.link.last={...this.link.last, playhead:0, _recvCtxTime:this.ctx.currentTime, ended:false};
   }
 
   play(){ if(!this.track) return; this._playing=true; this.link.play(); }
@@ -1793,6 +1894,9 @@ function App(){
   const [lib,setLib]=useState([]);
   const [q,setQ]=useState('');
   const [xfade,setXfade]=useState(0.5);
+  // Mirror of xfade for the auto-mixer, which needs the current fader position
+  // synchronously when a blend starts (React state isn't readable mid-callback).
+  const xfadeRef=useRef(0.5);
   const [volA,setVolA]=useState(0.8);
   const [volB,setVolB]=useState(0.8);
   const [xfadeCD,setXfadeCD]=useState(0.5);
@@ -1930,6 +2034,7 @@ function App(){
 
   // --- crossfader: constant-power curve so the middle doesn't dip ---
   useEffect(()=>{
+    xfadeRef.current=xfade;
     const t=E.ctx.currentTime;
     E.a.xf.gain.setTargetAtTime(Math.cos(xfade*Math.PI/2), t, 0.01);
     E.b.xf.gain.setTargetAtTime(Math.cos((1-xfade)*Math.PI/2), t, 0.01);
@@ -2076,6 +2181,150 @@ function App(){
   const removeFromCrate=(crateId,trackId)=>{
     setCrates(cs=>cs.map(c=>c.id===crateId ? {...c,trackIds:c.trackIds.filter(id=>id!==trackId)} : c));
   };
+
+  /* --- AUTO-DJ -------------------------------------------------------
+     Runs the A/B pair hands-free: picks the next track by tempo + key
+     compatibility (see trackScore above), loads it onto the free deck,
+     beat-syncs it, and crossfades over the last few seconds of the
+     outgoing track. C/D are deliberately left alone so you can still
+     drop a manual track over the top of an auto-mixed set.
+     Everything it does goes through the same primitives the UI does
+     (loadTo / doSync / setXfade), so taking over mid-set is just a
+     matter of switching it off — nothing to unwind. */
+  const AUTO_XFADE_SEC=8;      // length of the blend
+  const AUTO_LEAD_SEC=12;      // start the blend this far from the end
+  const [autoDj,setAutoDj]=useState(false);
+  const [autoNext,setAutoNext]=useState(null);   // track queued for the next blend (display only)
+  const autoBusy=useRef(false);                  // a transition is in flight — don't start another
+  const autoPlayed=useRef(new Set());            // ids played this session, so the set doesn't loop
+
+  // Pool: the active crate if one is selected, otherwise the whole library.
+  // Deliberately NOT the search-filtered `shown` — typing in the search box
+  // shouldn't silently change what the auto-mixer is allowed to play next.
+  const autoPool=useMemo(()=>{
+    const crate=activeCrate ? crates.find(c=>c.id===activeCrate) : null;
+    return crate ? lib.filter(t=>crate.trackIds.includes(t.id)) : lib;
+  },[lib,crates,activeCrate]);
+  const autoPoolRef=useRef(autoPool); useEffect(()=>{ autoPoolRef.current=autoPool; },[autoPool]);
+
+  // Animate the crossfader from wherever it is to `target` over AUTO_XFADE_SEC,
+  // moving the same React state a hand would, so the on-screen fader and the
+  // audio stay in step.
+  //
+  // Deliberately setInterval + wall-clock, NOT requestAnimationFrame: rAF is
+  // suspended outright in a hidden tab, so a user switching away mid-blend
+  // would freeze the transition forever with both decks audible and autoBusy
+  // stuck true. setInterval is merely throttled (~1s) in the background, and
+  // because progress is derived from elapsed time rather than accumulated per
+  // tick, a throttled tick still lands on the right value and the blend still
+  // finishes on schedule.
+  const autoCrossfade=(target,fadeSec,onDone)=>{
+    const start=Date.now();
+    const from=xfadeRef.current;
+    const iv=setInterval(()=>{
+      const k=Math.min(1,(Date.now()-start)/(fadeSec*1000));
+      setXfade(from+(target-from)*k);
+      if(k>=1){ clearInterval(iv); onDone && onDone(); }
+    },50);
+    return ()=>clearInterval(iv);
+  };
+
+  // Blend timings scaled to the outgoing track. The 12s lead / 8s fade suit a
+  // normal 3-5 minute track, but on a short loop or edit they'd cover the
+  // whole thing — the next blend would start the instant the last one ended,
+  // with no stretch of the track ever playing on its own. Capping both to a
+  // fraction of the duration keeps short material listenable, and the floor on
+  // `lead` guarantees the fade always finishes before the track runs out.
+  const autoTimings=(dur)=>{
+    const fade=Math.min(AUTO_XFADE_SEC, dur*0.25);
+    const lead=Math.max(fade, Math.min(AUTO_LEAD_SEC, dur*0.4));
+    return {fade, lead};
+  };
+
+  useEffect(()=>{
+    if(!autoDj) return;
+    const tick=async()=>{
+      if(autoBusy.current) return;
+      const pool=autoPoolRef.current;
+      if(!pool.length) return;
+
+      const live=['a','b'].filter(w=>E[w].playing && E[w].track);
+
+      // Cold start: nothing rolling on A/B — load the first track and go.
+      if(live.length===0){
+        const pick=pickNextTrack(null,pool,autoPlayed.current);
+        if(!pick) return;
+        autoBusy.current=true;
+        try{
+          await loadTo(pick.track,'a');
+          autoPlayed.current.add(pick.track.id);
+          setXfade(0);            // hard left: deck A alone
+          E.a.play();
+          force();
+        } finally { autoBusy.current=false; }
+        return;
+      }
+
+      // Mid-set: only act on a single rolling deck. If both are playing we're
+      // either mid-blend or the user has taken manual control — either way,
+      // stay out of it.
+      if(live.length!==1) return;
+      const from=live[0], to=from==='a'?'b':'a';
+      const deck=E[from];
+      const remain=deck.duration-deck.position();
+
+      // Track has run off the end. The worklet keeps reporting `playing` past
+      // the end of the buffer, so without an explicit stop the deck sits
+      // "live" forever — live.length never falls back to 0, so the cold-start
+      // branch can never pick the set back up and auto mode is dead until the
+      // user intervenes. Stopping it here makes the stall self-healing.
+      if(remain<=0){ deck.pause(); force(); return; }
+
+      const {fade,lead}=autoTimings(deck.duration);
+      if(remain>lead) return;
+
+      let exclude=new Set(autoPlayed.current);
+      if(E[to].track) exclude.add(E[to].track.id);
+      let pick=pickNextTrack(deck.track,pool,exclude);
+      // Every track already played: wrap around rather than dead-ending the
+      // set, keeping only what's currently on the decks excluded so the next
+      // pick can't be an immediate repeat of what's audible.
+      if(!pick && autoPlayed.current.size){
+        autoPlayed.current=new Set([deck.track&&deck.track.id, E[to].track&&E[to].track.id].filter(Boolean));
+        exclude=new Set(autoPlayed.current);
+        pick=pickNextTrack(deck.track,pool,exclude);
+      }
+      if(!pick) return;   // genuinely nothing mixable — let the current track ride out
+
+      autoBusy.current=true;
+      try{
+        await loadTo(pick.track,to);
+        autoPlayed.current.add(pick.track.id);
+        setAutoNext(pick.track);
+        E[to].play();
+        // Beat-lock the incoming deck to the one already rolling. Same call
+        // the SYNC button makes, so it inherits the octave-fold handling and
+        // the ±16% range check.
+        deckRefs[to].current?.midiSync();
+        force();
+        autoCrossfade(to==='a'?0:1, fade, ()=>{
+          deck.pause();          // outgoing deck is silent by now — stop it
+          setAutoNext(null);
+          autoBusy.current=false;
+          force();
+        });
+      }catch(err){
+        console.warn('auto-dj transition failed', err);
+        autoBusy.current=false;
+      }
+    };
+    const iv=setInterval(tick,500);
+    return ()=>clearInterval(iv);
+  },[autoDj]);
+
+  // Leaving auto mode clears the queued-track readout; the played-set is kept
+  // so re-enabling it continues the set rather than replaying from the top.
+  useEffect(()=>{ if(!autoDj){ autoBusy.current=false; setAutoNext(null); } },[autoDj]);
 
   // --- drag & drop ---
   useEffect(()=>{
@@ -2234,6 +2483,14 @@ function App(){
           {Array.from({length:12},(_,i)=>
             <div key={i} style={{width:4,height:4+i*1,background:'#1a1f28',borderRadius:1}}/>)}
         </div>
+        <button className={'btn auto'+(autoDj?' on':'')}
+                onClick={()=>{E.ctx.resume();setAutoDj(v=>!v);}}
+                title="Auto-DJ: mixes decks A/B hands-free, choosing each next track by tempo and key compatibility. C/D stay manual.">
+          {autoDj?'■ AUTO ON':'✨ AUTO DJ'}
+        </button>
+        {autoDj && <span className="hint" style={{maxWidth:150,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+          {autoNext?`→ ${autoNext.title}`:`${autoPool.length} in pool`}
+        </span>}
         <button className={'btn rec'+(recording?' on':'')} onClick={toggleRec}>
           {recording?'■ STOP REC':'● REC MIX'}
         </button>
