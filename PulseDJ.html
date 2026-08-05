@@ -119,6 +119,13 @@
     color:var(--dim);font-size:10.5px;font-weight:700;cursor:pointer}
   .lbtn.on{background:var(--yel);color:#000;border-color:var(--yel)}
 
+  /* loop slicer — active loop cut into 8 equal steps, jump to any of them */
+  .slicer{display:grid;grid-template-columns:repeat(8,1fr);gap:3px}
+  .spad{height:22px;border-radius:4px;border:1px solid var(--line);background:var(--panel2);
+    color:var(--dim);font-size:9px;font-weight:700;cursor:pointer}
+  .spad.on{color:#000}
+  .spad:disabled{opacity:.3;cursor:not-allowed}
+
   .eqcol{display:flex;flex-direction:column;align-items:center;gap:9px;flex:0 0 auto}
   .knobwrap{display:flex;flex-direction:column;align-items:center;gap:3px}
   .knoblbl{font-size:9px;color:var(--dim);letter-spacing:1px;font-weight:700}
@@ -272,6 +279,7 @@
     .tbtn{padding:12px 4px; font-size:12px}
     .hcue{height:44px; font-size:12px}
     .lbtn{height:38px; font-size:12px}
+    .spad{height:32px; font-size:11px}
     .mini{padding:6px 9px; font-size:11px}
     .search{width:100%}
 
@@ -1264,6 +1272,7 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
   const [,force]=useState(0);
   const [pitch,setPitch]=useState(0);           // percent
   const [eq,setEq]=useState({low:0,mid:0,high:0});
+  const [midQ,setMidQ]=useState(0.9);   // parametric-ish mid band: narrower Q = more surgical notch/boost
   const [filter,setFilter]=useState(0);         // -1 .. 1
   const [fx,setFx]=useState({amount:0, type:'delay'});
   const [syncFail,setSyncFail]=useState(false);
@@ -1366,6 +1375,14 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
     setEq(e=>({...e,[band]:v}));
     const node = band==='low'?deck.low : band==='mid'?deck.mid : deck.high;
     node.gain.setTargetAtTime(v, deck.ctx.currentTime, 0.01);
+  };
+
+  // Mid band's Q: wide (~0.3) sounds like a musical broad EQ move, narrow
+  // (~8) turns it into a surgical notch/boost for cutting out a single
+  // clashing frequency without touching the rest of the mix.
+  const setMidQKnob=(v)=>{
+    setMidQ(v);
+    deck.mid.Q.setTargetAtTime(v, deck.ctx.currentTime, 0.01);
   };
 
   const setFilterKnob=(v)=>{
@@ -1554,6 +1571,23 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
             ))}
           </div>
 
+          <div className="slicer" title={deck.loop?'loop slicer — jump to any of the 8 steps within the active loop':'loop slicer — set a loop (1/2/4/8 above) to slice it into 8 steps'}>
+            {Array.from({length:8},(_,i)=>{
+              const active=!!deck.loop;
+              const stepLen=active ? (deck.loop.end-deck.loop.start)/8 : 0;
+              const stepStart=active ? deck.loop.start+i*stepLen : 0;
+              const isCurrent=active && ui.pos>=stepStart && ui.pos<stepStart+stepLen;
+              return (
+                <button key={i} className={'spad'+(isCurrent?' on':'')}
+                        style={isCurrent?{background:accent,borderColor:accent}:null}
+                        disabled={!active}
+                        onClick={()=>{ deck.jumpTo(stepStart); rerender(); }}>
+                  {i+1}
+                </button>
+              );
+            })}
+          </div>
+
           <div className="row" style={{gap:8,alignItems:'center'}}>
             <Knob label="FILTER" value={filter} min={-1} max={1} center
                   onChange={setFilterKnob} color={accent} size={40}
@@ -1578,6 +1612,10 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
                 onChange={v=>setEqBand('high',v)} fmt={v=>v.toFixed(0)+'dB'} size={36}/>
           <Knob label="MID" value={eq.mid} min={-26} max={12} center color={accent}
                 onChange={v=>setEqBand('mid',v)} fmt={v=>v.toFixed(0)+'dB'} size={36}/>
+          <div title="mid band width — wide is a musical EQ move, narrow is a surgical notch">
+            <Knob label="Q" value={midQ} min={0.3} max={8} color={accent}
+                  onChange={setMidQKnob} fmt={v=>v.toFixed(1)} size={26}/>
+          </div>
           <Knob label="LOW" value={eq.low} min={-26} max={12} center color={accent}
                 onChange={v=>setEqBand('low',v)} fmt={v=>v.toFixed(0)+'dB'} size={36}/>
 
