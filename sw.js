@@ -12,7 +12,7 @@
    Bump CACHE on any asset change — the old cache is dropped on activate.
    ===================================================================== */
 
-const CACHE = 'pulse-dj-v8';
+const CACHE = 'pulse-dj-v9';
 
 const ASSETS = [
   './',

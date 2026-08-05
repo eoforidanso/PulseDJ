@@ -171,15 +171,19 @@
     background:linear-gradient(#414b60,#232936);border:1px solid #545f75;margin-top:-11px;box-shadow:0 1px 3px #000}
 
   /* library */
-  .lib{flex:0 0 auto;height:172px;background:var(--panel);border-top:1px solid var(--line);
+  .lib{flex:0 0 auto;height:200px;background:var(--panel);border-top:1px solid var(--line);
     display:flex;flex-direction:column}
   .libhead{display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid var(--line)}
   .libhead h3{font-size:11px;letter-spacing:1.6px;color:var(--dim);font-weight:700}
   .search{background:#05070a;border:1px solid var(--line);border-radius:5px;color:var(--txt);
     padding:5px 9px;font-size:11.5px;width:210px;outline:none}
   .search:focus{border-color:#3a4356}
+  /* crate bar: ALL TRACKS + one chip per crate, filters the list below like
+     the FX tag chips do — a crate is just a saved set of library track ids */
+  .cratebar{display:flex;align-items:center;gap:6px;padding:5px 12px;
+    border-bottom:1px solid var(--line);flex-wrap:wrap}
   .liblist{flex:1;overflow-y:auto}
-  .lrow{display:grid;grid-template-columns:1fr 88px 45px 90px 60px 60px 140px;gap:8px;align-items:center;
+  .lrow{display:grid;grid-template-columns:1fr 88px 45px 90px 60px 60px 190px;gap:8px;align-items:center;
     padding:6px 12px;border-bottom:1px solid #14181f;font-size:11.5px;cursor:grab}
   .lrow:hover{background:#161b23}
   .lrow .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
@@ -1033,6 +1037,20 @@ const MIDI_CONTROLS=[
   {id:'xfcd',   label:'Crossfader C / D', kind:'fader'},
   {id:'master', label:'Master Gain',      kind:'fader'},
 ];
+
+// Crates: named subsets of the library (by track id), persisted independently
+// of the library itself — the library is re-analysed from dropped files each
+// session, but crates need to survive that and just re-attach once the same
+// files are re-imported (matching is by id, so re-imported tracks get fresh
+// ids and won't auto-rejoin; that's an acceptable v1 limitation).
+const CRATES_KEY='pulsedj.crates.v1';
+function loadCrates(){
+  try{ return JSON.parse(localStorage.getItem(CRATES_KEY)) || []; }
+  catch{ return []; }
+}
+function saveCrates(crates){
+  try{ localStorage.setItem(CRATES_KEY, JSON.stringify(crates)); }catch{}
+}
 
 // FX-file categories used both to tag library rows and to populate each deck's
 // FX slot. Colours double as the row-pill / filter-chip accent per tag.
@@ -1904,14 +1922,56 @@ function App(){
 
   // Drop a track from the library list, releasing its decoded AudioBuffer for
   // GC. A deck that already loaded it keeps its own reference and plays on —
-  // this only removes the library entry, it doesn't unload a live deck.
-  const removeTrack=(id)=>setLib(L=>L.filter(t=>t.id!==id));
+  // this only removes the library entry, it doesn't unload a live deck. Also
+  // purges the id from every crate so crates don't accumulate dangling refs.
+  const removeTrack=(id)=>{
+    setLib(L=>L.filter(t=>t.id!==id));
+    setCrates(cs=>cs.map(c=>({...c,trackIds:c.trackIds.filter(tid=>tid!==id)})));
+  };
 
   // Set/clear a library row's FX tag (Sweep/Riser/Impact/Stinger).
   const setTag=(id,tag)=>setLib(L=>L.map(t=>t.id===id?{...t,tag:tag||null}:t));
   // Only tagged files populate the decks' FX slots.
   const fxItems=useMemo(()=>lib.filter(t=>t.tag),[lib]);
   const [tagFilter,setTagFilter]=useState('');   // '' = show all; else a single FX tag
+
+  // --- crates: named, persisted subsets of the library (by track id) ---
+  const [crates,setCratesState]=useState(loadCrates);
+  const [activeCrate,setActiveCrate]=useState(null);   // crate id, or null = all tracks
+  const setCrates=(updater)=>{
+    setCratesState(prev=>{
+      const next = typeof updater==='function' ? updater(prev) : updater;
+      saveCrates(next);
+      return next;
+    });
+  };
+  const newCrate=()=>{
+    const name=(prompt('Crate name:')||'').trim();
+    if(!name) return;
+    const c={id:Math.random().toString(36).slice(2), name, trackIds:[]};
+    setCrates(cs=>[...cs,c]);
+    setActiveCrate(c.id);
+  };
+  const renameCrate=(id)=>{
+    const c=crates.find(x=>x.id===id); if(!c) return;
+    const name=(prompt('Rename crate:', c.name)||'').trim();
+    if(!name) return;
+    setCrates(cs=>cs.map(x=>x.id===id?{...x,name}:x));
+  };
+  const deleteCrate=(id)=>{
+    const c=crates.find(x=>x.id===id); if(!c) return;
+    if(!confirm(`Delete crate "${c.name}"? Tracks stay in the library.`)) return;
+    setCrates(cs=>cs.filter(x=>x.id!==id));
+    if(activeCrate===id) setActiveCrate(null);
+  };
+  const addToCrate=(crateId,trackId)=>{
+    if(!crateId) return;
+    setCrates(cs=>cs.map(c=>c.id===crateId && !c.trackIds.includes(trackId)
+      ? {...c,trackIds:[...c.trackIds,trackId]} : c));
+  };
+  const removeFromCrate=(crateId,trackId)=>{
+    setCrates(cs=>cs.map(c=>c.id===crateId ? {...c,trackIds:c.trackIds.filter(id=>id!==trackId)} : c));
+  };
 
   // --- drag & drop ---
   useEffect(()=>{
@@ -2032,12 +2092,14 @@ function App(){
 
   const shown=useMemo(()=>{
     const s=q.trim().toLowerCase();
+    const crate=activeCrate ? crates.find(c=>c.id===activeCrate) : null;
     return lib.filter(t=>{
+      if(crate && !crate.trackIds.includes(t.id)) return false;
       if(tagFilter && t.tag!==tagFilter) return false;
       if(s && !(t.title+' '+t.artist).toLowerCase().includes(s)) return false;
       return true;
     });
-  },[lib,q,tagFilter]);
+  },[lib,q,tagFilter,activeCrate,crates]);
 
   const fileInput=useRef(null);
 
@@ -2195,6 +2257,19 @@ function App(){
           <div className="spacer" style={{flex:1}}/>
           <span className="hint">double-click a row to load the free deck</span>
         </div>
+        <div className="cratebar">
+          <button className={'chip'+(activeCrate===null?' on':'')} onClick={()=>setActiveCrate(null)}>ALL TRACKS</button>
+          {crates.map(c=>(
+            <button key={c.id} className={'chip'+(activeCrate===c.id?' on':'')}
+                    onClick={()=>setActiveCrate(c.id)}
+                    onDoubleClick={()=>renameCrate(c.id)}
+                    title="double-click to rename">
+              {c.name} · {c.trackIds.length}
+            </button>
+          ))}
+          <button className="mini" onClick={newCrate}>+ NEW CRATE</button>
+          {activeCrate && <button className="mini" onClick={()=>deleteCrate(activeCrate)}>DELETE CRATE</button>}
+        </div>
         <div className="liblist">
           {shown.length===0 && <div className="empty">
             Drag audio files anywhere in the window, or hit <b>+ ADD TRACKS</b>.<br/>
@@ -2217,8 +2292,8 @@ function App(){
               <div className="mu">{t.bpm.toFixed(1)} BPM</div>
               <div className="mu">{fmtTime(t.duration).split('.')[0]}</div>
               <div className="mu">{Math.round(t.file.size/1048576*10)/10} MB</div>
-              <div style={{display:'flex',gap:6}}>
-                <select className="tagsel" style={{width:62,flex:'none'}}
+              <div style={{display:'flex',gap:5}}>
+                <select className="tagsel" style={{width:56,flex:'none'}}
                         value="" onClick={e=>e.stopPropagation()}
                         onChange={e=>{ if(e.target.value) loadTo(t,e.target.value); }}>
                   <option value="">→ deck</option>
@@ -2227,6 +2302,15 @@ function App(){
                   <option value="c">C</option>
                   <option value="d">D</option>
                 </select>
+                <select className="tagsel" style={{width:30,flex:'none'}} value=""
+                        title="add to crate" onClick={e=>e.stopPropagation()}
+                        onChange={e=>{ if(e.target.value) addToCrate(e.target.value, t.id); }}>
+                  <option value="">🗂</option>
+                  {crates.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                {activeCrate &&
+                  <button className="mini" title="remove from this crate"
+                          onClick={(e)=>{e.stopPropagation();removeFromCrate(activeCrate,t.id);}}>−</button>}
                 <button className="mini" title="remove from library"
                         onClick={(e)=>{e.stopPropagation();removeTrack(t.id);}}>✕</button>
               </div>
