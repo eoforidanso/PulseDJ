@@ -12,7 +12,7 @@
    Bump CACHE on any asset change — the old cache is dropped on activate.
    ===================================================================== */
 
-const CACHE = 'pulse-dj-v13';
+const CACHE = 'pulse-dj-v14';
 
 const ASSETS = [
   './',
@@ -23,6 +23,7 @@ const ASSETS = [
   'vendor/babel.min.js',
   'engine/deck-processor.js',
   'engine/scheduler.js',
+  'engine/analyzer.worker.js',
   'icon-192.png',
   'icon-512.png',
   'icon-maskable-512.png',

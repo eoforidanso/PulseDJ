@@ -324,205 +324,103 @@ let DeckLink, MasterClock, LOOKAHEAD_SEC;
    ANALYSIS  — peaks, 3-band colouring, BPM, beat phase
    ============================================================ */
 
-// Build per-bucket peak + 3-band energy data used to draw the waveform.
-function analysePeaks(buffer, bucketSamples){
-  const n = buffer.length;
-  const buckets = Math.ceil(n / bucketSamples);
-  const chL = buffer.getChannelData(0);
-  const chR = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : chL;
-
-  const peak = new Float32Array(buckets);
-  const low  = new Float32Array(buckets);
-  const mid  = new Float32Array(buckets);
-  const high = new Float32Array(buckets);
-
-  // One-pole splits: lp tracks bass, (x-lp) is everything above,
-  // a second pole on that separates mids from highs. Cheap but reads well.
-  const sr = buffer.sampleRate;
-  const aLow  = Math.exp(-2*Math.PI*200/sr);
-  const aMid  = Math.exp(-2*Math.PI*2000/sr);
-  let lpB=0, lpM=0;
-
-  for(let b=0;b<buckets;b++){
-    const s0=b*bucketSamples, s1=Math.min(n,s0+bucketSamples);
-    let pk=0, eL=0, eM=0, eH=0;
-    for(let i=s0;i<s1;i++){
-      const x=(chL[i]+chR[i])*0.5;
-      const ax=x<0?-x:x;
-      if(ax>pk) pk=ax;
-      lpB = x + aLow*(lpB - x);          // < 200 Hz
-      const above = x - lpB;
-      lpM = above + aMid*(lpM - above);  // 200 Hz – 2 kHz
-      const hi = above - lpM;            // > 2 kHz
-      eL += lpB*lpB; eM += lpM*lpM; eH += hi*hi;
-    }
-    const cnt = Math.max(1, s1-s0);
-    peak[b]=pk;
-    low[b]=Math.sqrt(eL/cnt); mid[b]=Math.sqrt(eM/cnt); high[b]=Math.sqrt(eH/cnt);
-  }
-  return {peak, low, mid, high, buckets, bucketSamples};
+// The heavy per-sample analysis (peaks, tempo, key) lives in a worker —
+// see engine/analyzer.worker.js. Run inline it locked the UI for the whole
+// of an import; dropping a folder of tracks froze the app solid.
+let _analyzer=null, _analyzerSeq=0;
+const _analyzerPending=new Map();
+function analyzer(){
+  if(_analyzer) return _analyzer;
+  _analyzer=new Worker('./engine/analyzer.worker.js');
+  _analyzer.onmessage=(e)=>{
+    const {reqId}=e.data;
+    const p=_analyzerPending.get(reqId);
+    if(!p) return;
+    _analyzerPending.delete(reqId);
+    e.data.ok ? p.resolve(e.data) : p.reject(new Error(e.data.error));
+  };
+  _analyzer.onerror=(err)=>{
+    // A worker-level failure kills every request in flight, not just one.
+    for(const p of _analyzerPending.values()) p.reject(new Error(err.message||'analyser failed'));
+    _analyzerPending.clear();
+  };
+  return _analyzer;
 }
 
-// Onset-energy envelope at ~172 fps, used for both tempo and beat phase.
-function onsetEnvelope(buffer){
-  const hop = 256;
-  const ch = buffer.getChannelData(0);
-  const n = buffer.length;
-  const frames = Math.floor(n/hop);
-  const env = new Float32Array(frames);
-  let prev = 0;
-  for(let f=0;f<frames;f++){
-    let e=0;
-    const s0=f*hop;
-    for(let i=s0;i<s0+hop;i++){ const x=ch[i]; e+=x*x; }
-    e=Math.sqrt(e/hop);
-    env[f]=Math.max(0, e-prev);   // half-wave rectified difference = onsets
-    prev=e;
-  }
-  return {env, fps: buffer.sampleRate/hop};
+// Decode stays on the main thread (it needs the AudioContext, and being
+// native + async never blocked anything); only the raw samples cross over.
+// The channel copies are transferred rather than cloned, so a long track
+// doesn't get duplicated in memory just to be measured.
+function analyseTrack(buffer, bucketSamples){
+  const channels=[];
+  for(let c=0;c<Math.min(2,buffer.numberOfChannels);c++) channels.push(buffer.getChannelData(c).slice());
+  const reqId=++_analyzerSeq;
+  return new Promise((resolve,reject)=>{
+    _analyzerPending.set(reqId,{resolve,reject});
+    analyzer().postMessage(
+      {reqId, channels, sampleRate:buffer.sampleRate, length:buffer.length,
+       duration:buffer.duration, bucketSamples},
+      channels.map(c=>c.buffer));
+  });
 }
 
-// Autocorrelation of the onset envelope over a musical lag range.
-function detectTempo(buffer){
-  const {env, fps} = onsetEnvelope(buffer);
-  const N = env.length;
-  if(N < 64) return {bpm:120, beatOffset:0, confidence:0};
+/* ============================================================
+   LIBRARY PERSISTENCE
+   ------------------------------------------------------------
+   Tracks live in IndexedDB (localStorage can't hold audio), keyed by a
+   content-derived id. Two things follow from that id being stable:
 
-  // normalise
-  let mean=0; for(let i=0;i<N;i++) mean+=env[i]; mean/=N;
-  const e = new Float32Array(N);
-  for(let i=0;i<N;i++) e[i]=env[i]-mean;
+   - Crates finally work across reloads. They store track ids, and ids
+     used to be Math.random(), so every saved crate came back pointing at
+     tracks that could never exist again — silently, permanently empty.
+   - Re-importing a file you already have is free: the id matches, so the
+     stored analysis is reused instead of being recomputed.
 
-  const minBpm=70, maxBpm=185;
-  const minLag=Math.floor(fps*60/maxBpm), maxLag=Math.ceil(fps*60/minBpm);
+   Name+size is the basis rather than anything involving mtime, so the
+   same track copied between machines or re-downloaded still matches.
+   ============================================================ */
+const DB_NAME='pulsedj', DB_STORE='tracks', DB_VERSION=1;
 
-  let best=-Infinity, bestLag=minLag;
-  const scores=new Float32Array(maxLag+1);
-  for(let lag=minLag; lag<=maxLag; lag++){
-    let s=0;
-    for(let i=0;i+lag<N;i++) s+=e[i]*e[i+lag];
-    s/=(N-lag);
-    scores[lag]=s;
-    if(s>best){best=s;bestLag=lag;}
-  }
-
-  // Smooth before peak-picking: the raw curve is jittery enough that a rising
-  // shoulder can outrank the peak it leads to (this reported 90 BPM as 98.4).
-  const sm=new Float32Array(maxLag+1);
-  for(let lag=minLag; lag<=maxLag; lag++){
-    const a=scores[lag-1]!==undefined?scores[lag-1]:scores[lag];
-    const b2=scores[lag+1]!==undefined?scores[lag+1]:scores[lag];
-    sm[lag]=(a+2*scores[lag]+b2)/4;
-  }
-
-  // A periodic signal correlates just as well at 2T, 3T… as at T, so the global
-  // peak is often a multiple of the real beat. Walk up from the shortest lag and
-  // take the first genuine local maximum that clears FUND_TH — the fundamental.
-  // Requiring a local max (not just a threshold crossing) is what rejects shoulders.
-  //
-  // FUND_TH is tuned against a synthetic 90–174 BPM suite: a beat that alternates
-  // every other bar can score as low as ~0.6 of the two-beat peak, while genuine
-  // half-beat subdivisions (busy hats) stay well under. Tracks whose true beat
-  // falls below this — very alternation-heavy drum & bass — land an octave low
-  // and are corrected with the deck's ×2 button. No purely autocorrelation-based
-  // detector resolves that case; real DJ software ships the same manual override.
-  const FUND_TH = 0.60;
-  let fundLag = bestLag;
-  for(let lag=minLag+1; lag<maxLag; lag++){
-    if(sm[lag] >= best*FUND_TH && sm[lag] >= sm[lag-1] && sm[lag] >= sm[lag+1]){
-      fundLag = lag; break;
-    }
-  }
-
-  // Integer lags are ~1.6 BPM apart up here, far too coarse to beatmatch with.
-  // Fit a parabola through the peak and its neighbours for a sub-frame lag.
-  let refined = fundLag;
-  if(fundLag>minLag && fundLag<maxLag){
-    const y0=scores[fundLag-1], y1=scores[fundLag], y2=scores[fundLag+1];
-    const denom = y0 - 2*y1 + y2;
-    if(denom !== 0){
-      const shift = 0.5*(y0-y2)/denom;
-      if(Math.abs(shift) <= 1) refined = fundLag + shift;
-    }
-  }
-
-  let bpm = 60*fps/refined;
-  while(bpm > maxBpm) bpm/=2;
-  while(bpm < minBpm) bpm*=2;
-
-  // Beat phase: slide a comb of beat positions and take the best-scoring offset.
-  const lag = 60*fps/bpm;
-  let bestPhase=0, bestPhaseScore=-Infinity;
-  const steps=Math.round(lag);
-  for(let p=0;p<steps;p++){
-    let s=0, c=0;
-    for(let t=p; t<N; t+=lag){ s+=env[Math.round(t)]||0; c++; }
-    if(c) s/=c;
-    if(s>bestPhaseScore){bestPhaseScore=s;bestPhase=p;}
-  }
-
-  return {bpm:Math.round(bpm*10)/10, beatOffset:bestPhase/fps};
+function trackKey(file){
+  const basis=`${file.name}|${file.size}`;
+  let h=2166136261;                                  // FNV-1a
+  for(let i=0;i<basis.length;i++){ h^=basis.charCodeAt(i); h=Math.imul(h,16777619); }
+  return (h>>>0).toString(36)+'-'+file.size.toString(36);
 }
 
-// Detect the key of a track using Krumhansl-Schmuckler correlation.
-// Returns a key name (C, C#, D, ..., B) and mode (major/minor).
-function detectKey(buffer){
-  const sr = buffer.sampleRate;
-  const ch = buffer.getChannelData(0);
+function openDb(){
+  return new Promise((resolve,reject)=>{
+    if(!self.indexedDB){ reject(new Error('IndexedDB unavailable')); return; }
+    const req=indexedDB.open(DB_NAME,DB_VERSION);
+    req.onupgradeneeded=()=>{
+      const db=req.result;
+      if(!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE,{keyPath:'id'});
+    };
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error);
+  });
+}
+function dbTx(mode,fn){
+  return openDb().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(DB_STORE,mode);
+    const out=fn(tx.objectStore(DB_STORE));
+    tx.oncomplete=()=>resolve(out && out.result!==undefined ? out.result : out);
+    tx.onerror=()=>reject(tx.error);
+    tx.onabort=()=>reject(tx.error);
+  }));
+}
+const dbGetAll =()=>dbTx('readonly',  s=>s.getAll());
+const dbGet    =(id)=>dbTx('readonly', s=>s.get(id));
+const dbPut    =(rec)=>dbTx('readwrite',s=>s.put(rec));
+const dbDelete =(id)=>dbTx('readwrite',s=>s.delete(id));
 
-  // Krumhansl-Schmuckler major and minor key profiles (normalized energy weights).
-  // These correlate the chromatic pitch distribution against known major/minor scales.
-  const majorProfile = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
-  const minorProfile = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
-  const noteNames = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-
-  // Extract a chroma vector: estimate energy in 12 pitch classes via bandpass filtering.
-  // For speed, use a simplified approach: sample the signal at key frequencies and measure energy.
-  const chroma = new Float32Array(12);
-  const freqPerSemitone = 2 ** (1/12);
-  const baseFreq = 130.81;  // C3
-
-  // Very simple chroma: divide signal into octaves and estimate pitch energy.
-  for (let octave = 0; octave < 3; octave++) {
-    for (let semitone = 0; semitone < 12; semitone++) {
-      const f = baseFreq * Math.pow(freqPerSemitone, semitone + octave * 12);
-      if (f > sr / 2) continue;
-      // Measure energy in a band around this pitch via autocorrelation at that lag.
-      const lag = Math.round(sr / f);
-      if (lag < 2 || lag > ch.length / 4) continue;
-      let corr = 0, c1 = 0, c2 = 0;
-      for (let i = lag; i < Math.min(lag + sr * 0.1, ch.length); i++) {
-        const a = ch[i], b = ch[i - lag];
-        corr += a * b; c1 += a * a; c2 += b * b;
-      }
-      const norm = Math.sqrt(c1 * c2);
-      if (norm > 0) chroma[semitone] += corr / norm;
-    }
-  }
-
-  // Normalize chroma vector.
-  const chromaSum = Math.max(1e-9, [...chroma].reduce((a,b)=>a+b, 0));
-  for (let i = 0; i < 12; i++) chroma[i] /= chromaSum;
-
-  // Correlate against major and minor profiles for each transposition.
-  let bestKey = 0, bestMode = 0, bestCorr = -Infinity;
-  for (let tonic = 0; tonic < 12; tonic++) {
-    // Rotate chroma to align with this tonic.
-    const rotated = new Float32Array(12);
-    for (let i = 0; i < 12; i++) rotated[i] = chroma[(i + tonic) % 12];
-
-    // Correlate with major profile.
-    let majCorr = 0;
-    for (let i = 0; i < 12; i++) majCorr += rotated[i] * majorProfile[i];
-    if (majCorr > bestCorr) { bestCorr = majCorr; bestKey = tonic; bestMode = 0; }
-
-    // Correlate with minor profile.
-    let minCorr = 0;
-    for (let i = 0; i < 12; i++) minCorr += rotated[i] * minorProfile[i];
-    if (minCorr > bestCorr) { bestCorr = minCorr; bestKey = tonic; bestMode = 1; }
-  }
-
-  return {key: noteNames[bestKey], mode: bestMode ? 'minor' : 'major', confidence: Math.round(bestCorr*100)/100};
+// Everything needed to rebuild a library row without re-analysing. The File
+// itself is stored too — it is structured-cloneable and keeps .name/.size,
+// which the row's size column and the id derivation both read back.
+function toRecord(t){
+  return {id:t.id, file:t.file, title:t.title, artist:t.artist,
+          bpm:t.bpm, beatOffset:t.analysis.beatOffset, duration:t.duration,
+          key:t.key, mode:t.mode, tag:t.tag, peaks:t.peaks};
 }
 
 /* ============================================================
@@ -2071,35 +1969,108 @@ function App(){
   useEffect(()=>{ const iv=setInterval(()=>force(), 200); return ()=>clearInterval(iv); },[]);
 
   // --- file ingest ---
+  // Split a filename into artist/title on the usual "Artist - Title" pattern.
+  const namePartsOf=(name)=>{
+    const base=name.replace(/\.[^.]+$/,'');
+    const m=base.match(/^(.*?)\s*[-–]\s*(.*)$/);
+    return {title:(m?m[2]:base).trim(), artist:(m?m[1]:'Unknown artist').trim()};
+  };
+
   const ingest=useCallback(async(files)=>{
     const audio=[...files].filter(f=>/\.(mp3|wav|m4a|aac|ogg|flac|aiff?|opus|webm)$/i.test(f.name)||f.type.startsWith('audio'));
     if(!audio.length) return;
     for(let i=0;i<audio.length;i++){
       const f=audio[i];
-      setBusy(`Analysing ${f.name} (${i+1}/${audio.length})…`);
+      const id=trackKey(f);
+      // Already on screen — dropping the same file twice shouldn't duplicate
+      // the row (and with content-derived ids it would collide anyway).
+      let dup=false;
+      setLib(L=>{ dup=L.some(t=>t.id===id); return L; });
+      await new Promise(r=>setTimeout(r,0));
+      if(dup) continue;
+
       try{
         const buf=await E.ctx.decodeAudioData(await f.arrayBuffer());
-        const peaks=analysePeaks(buf, 512);
-        const analysis=detectTempo(buf);
-        const keyAnalysis=detectKey(buf);  // key: 'C' | 'C#' | ..., mode: 'major' | 'minor'
-        const base=f.name.replace(/\.[^.]+$/,'');
-        const m=base.match(/^(.*?)\s*[-–]\s*(.*)$/);
-        setLib(L=>[...L,{
-          id:Math.random().toString(36).slice(2),
-          file:f, buffer:buf, peaks, analysis,
-          title:(m?m[2]:base).trim(),
-          artist:(m?m[1]:'Unknown artist').trim(),
-          bpm:analysis.bpm, duration:buf.duration,
-          tag:detectTag(f.name),   // Sweep/Riser/Impact/Stinger guess; editable per row
-          key:keyAnalysis.key, mode:keyAnalysis.mode
-        }]);
+
+        // Seen before? Reuse the stored analysis instead of spending seconds
+        // recomputing tempo and key for a file we've already measured.
+        let rec=null;
+        try{ rec=await dbGet(id); }catch{}
+
+        let peaks, analysis, key, mode, tag, title, artist;
+        if(rec && rec.peaks && rec.bpm){
+          setBusy(`Restoring ${f.name} (${i+1}/${audio.length})…`);
+          ({title,artist,key,mode,tag}=rec);
+          peaks=rec.peaks;
+          analysis={bpm:rec.bpm, beatOffset:rec.beatOffset};
+        } else {
+          setBusy(`Analysing ${f.name} (${i+1}/${audio.length})…`);
+          const res=await analyseTrack(buf, 512);
+          peaks=res.peaks; analysis=res.tempo;
+          key=res.keyInfo.key; mode=res.keyInfo.mode;
+          tag=detectTag(f.name);   // Sweep/Riser/Impact/Stinger guess; editable per row
+          ({title,artist}=namePartsOf(f.name));
+        }
+
+        const track={
+          id, file:f, buffer:buf, peaks, analysis,
+          title, artist, bpm:analysis.bpm, duration:buf.duration,
+          tag:tag||null, key, mode
+        };
+        setLib(L=> L.some(t=>t.id===id) ? L : [...L,track]);
+        // Best-effort: a full disk or a browser with storage disabled costs
+        // persistence, not the import — the track still plays this session.
+        try{ await dbPut(toRecord(track)); }
+        catch(err){ console.warn('could not persist track', f.name, err); }
       }catch(err){
-        console.warn('decode failed', f.name, err);
-        setBusy(`Could not decode ${f.name}`);
+        console.warn('import failed', f.name, err);
+        setBusy(`Could not import ${f.name}`);
         await new Promise(r=>setTimeout(r,1200));
       }
     }
     setBusy('');
+  },[]);
+
+  // --- restore the library on startup -------------------------------------
+  // Only decoding happens here; tempo/key/peaks come back from storage, so a
+  // saved library reopens in about the time it takes to decode the audio
+  // rather than re-running full analysis on every track.
+  useEffect(()=>{
+    let cancelled=false;
+    (async()=>{
+      let recs=[];
+      try{ recs=await dbGetAll(); }
+      catch(err){ console.warn('library restore unavailable', err); return; }
+      if(!recs.length || cancelled) return;
+      setBusy(`Restoring library (${recs.length})…`);
+      const restored=[];
+      for(const r of recs){
+        if(cancelled) return;
+        try{
+          const buf=await E.ctx.decodeAudioData(await r.file.arrayBuffer());
+          restored.push({
+            id:r.id, file:r.file, buffer:buf, peaks:r.peaks,
+            analysis:{bpm:r.bpm, beatOffset:r.beatOffset},
+            title:r.title, artist:r.artist, bpm:r.bpm, duration:r.duration,
+            tag:r.tag||null, key:r.key, mode:r.mode
+          });
+        }catch(err){
+          // Unreadable record (corrupt blob, codec no longer supported) —
+          // drop it rather than wedging the whole restore on one bad row.
+          console.warn('dropping unreadable library entry', r.id, err);
+          try{ await dbDelete(r.id); }catch{}
+        }
+      }
+      if(cancelled) return;
+      // Merge rather than replace: an eager drag-and-drop during the restore
+      // shouldn't get clobbered when this finishes.
+      setLib(L=>{
+        const have=new Set(L.map(t=>t.id));
+        return [...L, ...restored.filter(t=>!have.has(t.id))];
+      });
+      setBusy('');
+    })();
+    return ()=>{ cancelled=true; };
   },[]);
 
   const loadTo=async(track,which)=>{
@@ -2124,10 +2095,26 @@ function App(){
   const removeTrack=(id)=>{
     setLib(L=>L.filter(t=>t.id!==id));
     setCrates(cs=>cs.map(c=>({...c,trackIds:c.trackIds.filter(tid=>tid!==id)})));
+    dbDelete(id).catch(err=>console.warn('could not un-persist track', id, err));
+  };
+
+  // Wipe the stored library. Worth having its own control now that tracks
+  // persist: without it the only way to reclaim the space is per-row, and a
+  // library big enough to be worth clearing is exactly the one that's slow
+  // to clear one row at a time.
+  const clearLibrary=async()=>{
+    if(!confirm(`Remove all ${lib.length} tracks from the library? Crates are kept, and anything already on a deck keeps playing.`)) return;
+    const ids=lib.map(t=>t.id);
+    setLib([]);
+    for(const id of ids){ try{ await dbDelete(id); }catch{} }
   };
 
   // Set/clear a library row's FX tag (Sweep/Riser/Impact/Stinger).
-  const setTag=(id,tag)=>setLib(L=>L.map(t=>t.id===id?{...t,tag:tag||null}:t));
+  const setTag=(id,tag)=>{
+    setLib(L=>L.map(t=>t.id===id?{...t,tag:tag||null}:t));
+    dbGet(id).then(rec=>{ if(rec) return dbPut({...rec, tag:tag||null}); })
+             .catch(err=>console.warn('could not persist tag', id, err));
+  };
   // Only tagged files populate the decks' FX slots.
   const fxItems=useMemo(()=>lib.filter(t=>t.tag),[lib]);
   const [tagFilter,setTagFilter]=useState('');   // '' = show all; else a single FX tag
@@ -2620,6 +2607,9 @@ function App(){
             ))}
           </div>
           <div className="spacer" style={{flex:1}}/>
+          {lib.length>0 &&
+            <button className="mini" onClick={clearLibrary}
+                    title="remove every track from the library and from stored data">CLEAR LIBRARY</button>}
           <span className="hint">double-click a row to load the free deck</span>
         </div>
         <div className="cratebar">
