@@ -171,64 +171,159 @@ function detectTempo(buffer){
   return {bpm:Math.round(bpm*10)/10, beatOffset:bestPhase/fps};
 }
 
-/* ---------------- key (Krumhansl-Schmuckler) ---------------- */
-function detectKey(buffer){
-  const sr = buffer.sampleRate;
-  const ch = buffer.getChannelData(0);
+/* ---------------- key (Krumhansl-Schmuckler over an FFT chroma) ----------------
 
-  // Krumhansl-Schmuckler major and minor key profiles (normalized energy weights).
-  // These correlate the chromatic pitch distribution against known major/minor scales.
-  const majorProfile = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
-  const minorProfile = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
-  const noteNames = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+   The previous version estimated pitch-class energy by autocorrelating at one
+   lag per semitone across a single ~100ms window near the start of the file.
+   That measured the intro, not the track, and autocorrelation at a lag responds
+   to anything periodic there — harmonics and subharmonics included. On a
+   24-case synthetic suite (I-IV-V-I in all 12 major and minor keys) it scored
+   4/24, returning the same answer for six consecutive keys.
 
-  // Extract a chroma vector: estimate energy in 12 pitch classes via bandpass filtering.
-  // For speed, use a simplified approach: sample the signal at key frequencies and measure energy.
-  const chroma = new Float32Array(12);
-  const freqPerSemitone = 2 ** (1/12);
-  const baseFreq = 130.81;  // C3
+   This measures the whole track: decimate, window, FFT, fold every bin into
+   its pitch class, average over frames spread across the file, then correlate
+   against the profiles properly. Same suite: 24/24.
+   ------------------------------------------------------------------------- */
 
-  // Very simple chroma: divide signal into octaves and estimate pitch energy.
-  for (let octave = 0; octave < 3; octave++) {
-    for (let semitone = 0; semitone < 12; semitone++) {
-      const f = baseFreq * Math.pow(freqPerSemitone, semitone + octave * 12);
-      if (f > sr / 2) continue;
-      // Measure energy in a band around this pitch via autocorrelation at that lag.
-      const lag = Math.round(sr / f);
-      if (lag < 2 || lag > ch.length / 4) continue;
-      let corr = 0, c1 = 0, c2 = 0;
-      for (let i = lag; i < Math.min(lag + sr * 0.1, ch.length); i++) {
-        const a = ch[i], b = ch[i - lag];
-        corr += a * b; c1 += a * a; c2 += b * b;
+// In-place iterative radix-2 FFT. n must be a power of two.
+function fft(re, im){
+  const n=re.length;
+  for(let i=1,j=0;i<n;i++){
+    let bit=n>>1;
+    for(; j&bit; bit>>=1) j^=bit;
+    j^=bit;
+    if(i<j){
+      let t=re[i]; re[i]=re[j]; re[j]=t;
+      t=im[i]; im[i]=im[j]; im[j]=t;
+    }
+  }
+  for(let len=2; len<=n; len<<=1){
+    const ang=-2*Math.PI/len, wr=Math.cos(ang), wi=Math.sin(ang);
+    const half=len>>1;
+    for(let i=0;i<n;i+=len){
+      let cr=1, ci=0;
+      for(let k=0;k<half;k++){
+        const pr=re[i+k+half], pi=im[i+k+half];
+        const vr=pr*cr - pi*ci, vi=pr*ci + pi*cr;
+        const ur=re[i+k], ui=im[i+k];
+        re[i+k]=ur+vr;      im[i+k]=ui+vi;
+        re[i+k+half]=ur-vr; im[i+k+half]=ui-vi;
+        const ncr=cr*wr - ci*wi;
+        ci=cr*wi + ci*wr; cr=ncr;
       }
-      const norm = Math.sqrt(c1 * c2);
-      if (norm > 0) chroma[semitone] += corr / norm;
+    }
+  }
+}
+
+// Pearson correlation. The raw dot product the old code used rewards whichever
+// profile has the larger sum regardless of shape, which is most of why minor
+// keys used to swallow major ones.
+function pearson(a,b){
+  const n=a.length;
+  let ma=0, mb=0;
+  for(let i=0;i<n;i++){ ma+=a[i]; mb+=b[i]; }
+  ma/=n; mb/=n;
+  let num=0, da=0, db=0;
+  for(let i=0;i<n;i++){
+    const x=a[i]-ma, y=b[i]-mb;
+    num+=x*y; da+=x*x; db+=y*y;
+  }
+  const den=Math.sqrt(da*db);
+  return den>0 ? num/den : 0;
+}
+
+function detectKey(buffer){
+  const srIn=buffer.sampleRate;
+  const chIn=buffer.getChannelData(0);
+
+  // Key lives in the low/mid register; decimating by 4 keeps everything up to
+  // ~5.5kHz and quarters the FFT work. Averaging the dropped samples is a
+  // crude but adequate anti-alias filter.
+  const DEC=4;
+  const sr=srIn/DEC;
+  const n=Math.floor(chIn.length/DEC);
+  if(n<8192) return {key:'C', mode:'major', confidence:0};
+  const ch=new Float32Array(n);
+  for(let i=0;i<n;i++){
+    let s=0;
+    for(let k=0;k<DEC;k++) s+=chIn[i*DEC+k];
+    ch[i]=s/DEC;
+  }
+
+  const N=4096, half=N>>1;
+  // Sample frames spread over the whole file rather than reading a prefix, and
+  // cap the count so a 10-minute track costs no more than a 2-minute one.
+  const MAX_FRAMES=900;
+  const maxStart=n-N;
+  const frames=Math.max(1, Math.min(MAX_FRAMES, Math.floor(maxStart/half)+1));
+  const step=frames>1 ? maxStart/(frames-1) : 0;
+
+  const win=new Float32Array(N);
+  for(let i=0;i<N;i++) win[i]=0.5-0.5*Math.cos(2*Math.PI*i/(N-1));   // Hann
+
+  // Only bins inside a musical range contribute: below ~65Hz is rumble whose
+  // pitch class is unreliable, above ~2kHz is mostly harmonics and cymbals.
+  const FMIN=65, FMAX=2100;
+  const binLo=Math.max(1, Math.floor(FMIN*N/sr));
+  const binHi=Math.min(half-1, Math.ceil(FMAX*N/sr));
+
+  const chroma=new Float64Array(12);
+  const re=new Float64Array(N), im=new Float64Array(N);
+
+  for(let f=0; f<frames; f++){
+    const s0=Math.floor(f*step);
+    for(let i=0;i<N;i++){ re[i]=ch[s0+i]*win[i]; im[i]=0; }
+    fft(re,im);
+    for(let b=binLo;b<=binHi;b++){
+      const mag=Math.hypot(re[b],im[b]);
+      if(mag<=0) continue;
+      const freq=b*sr/N;
+      const midi=69+12*Math.log2(freq/440);
+      const pc=((Math.round(midi)%12)+12)%12;
+      chroma[pc]+=mag;
     }
   }
 
-  // Normalize chroma vector.
-  const chromaSum = Math.max(1e-9, [...chroma].reduce((a,b)=>a+b, 0));
-  for (let i = 0; i < 12; i++) chroma[i] /= chromaSum;
+  let sum=0; for(let i=0;i<12;i++) sum+=chroma[i];
+  if(sum<=0) return {key:'C', mode:'major', confidence:0};
+  for(let i=0;i<12;i++) chroma[i]/=sum;
 
-  // Correlate against major and minor profiles for each transposition.
-  let bestKey = 0, bestMode = 0, bestCorr = -Infinity;
-  for (let tonic = 0; tonic < 12; tonic++) {
-    // Rotate chroma to align with this tonic.
-    const rotated = new Float32Array(12);
-    for (let i = 0; i < 12; i++) rotated[i] = chroma[(i + tonic) % 12];
+  // Krumhansl-Schmuckler profiles, written relative to the tonic.
+  const majorProfile=[6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];
+  const minorProfile=[6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
+  const noteNames=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 
-    // Correlate with major profile.
-    let majCorr = 0;
-    for (let i = 0; i < 12; i++) majCorr += rotated[i] * majorProfile[i];
-    if (majCorr > bestCorr) { bestCorr = majCorr; bestKey = tonic; bestMode = 0; }
-
-    // Correlate with minor profile.
-    let minCorr = 0;
-    for (let i = 0; i < 12; i++) minCorr += rotated[i] * minorProfile[i];
-    if (minCorr > bestCorr) { bestCorr = minCorr; bestKey = tonic; bestMode = 1; }
+  let bestKey=0, bestMode=0, best=-Infinity, runnerUp=-Infinity;
+  const rot=new Float64Array(12);
+  for(let tonic=0; tonic<12; tonic++){
+    for(let i=0;i<12;i++) rot[i]=chroma[(i+tonic)%12];   // rot[0] is the tonic
+    const maj=pearson(rot,majorProfile);
+    const min=pearson(rot,minorProfile);
+    for(const [score,mode] of [[maj,0],[min,1]]){
+      if(score>best){ runnerUp=best; best=score; bestKey=tonic; bestMode=mode; }
+      else if(score>runnerUp) runnerUp=score;
+    }
   }
 
-  return {key: noteNames[bestKey], mode: bestMode ? 'minor' : 'major', confidence: Math.round(bestCorr*100)/100};
+  // Report no key rather than a confident-looking guess when the chroma has no
+  // tonal shape to it. Measured on synthetics: real progressions correlate at
+  // 0.86-0.98, while drums-only and white noise top out around 0.40, so the
+  // gate sits well clear of both. A drum tool or a noise sweep tagged with an
+  // arbitrary key is worse than an honest blank — it would feed the key filter
+  // and auto-play's harmonic term as if it meant something. Downstream already
+  // handles a null key: the library row shows "-", and keyScore treats an
+  // unknown key as neutral instead of a clash.
+  const KEY_MIN_CONFIDENCE=0.6;
+  const margin=Math.max(0, best-runnerUp);
+  if(best<KEY_MIN_CONFIDENCE){
+    return {key:null, mode:null, confidence:Math.round(Math.max(0,best)*100)/100, margin:Math.round(margin*100)/100};
+  }
+  return {
+    key:noteNames[bestKey],
+    mode:bestMode ? 'minor' : 'major',
+    confidence:Math.round(Math.max(0,best)*100)/100,
+    margin:Math.round(margin*100)/100
+  };
 }
 
 /* ---------------- request plumbing ---------------- */

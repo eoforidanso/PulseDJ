@@ -381,6 +381,13 @@ function analyseTrack(buffer, bucketSamples){
    ============================================================ */
 const DB_NAME='pulsedj', DB_STORE='tracks', DB_VERSION=1;
 
+// Bump whenever the analysers change in a way that makes stored results wrong.
+// Stored tracks skip re-analysis on restore, so without this a library keeps
+// whatever its tracks were measured with on the day they were imported — the
+// key-detection rewrite would never have reached anything already imported.
+// Records carrying an older version get re-measured and rewritten.
+const ANALYSIS_VERSION=2;
+
 function trackKey(file){
   const basis=`${file.name}|${file.size}`;
   let h=2166136261;                                  // FNV-1a
@@ -418,7 +425,7 @@ const dbDelete =(id)=>dbTx('readwrite',s=>s.delete(id));
 // itself is stored too — it is structured-cloneable and keeps .name/.size,
 // which the row's size column and the id derivation both read back.
 function toRecord(t){
-  return {id:t.id, file:t.file, title:t.title, artist:t.artist,
+  return {id:t.id, av:ANALYSIS_VERSION, file:t.file, title:t.title, artist:t.artist,
           bpm:t.bpm, beatOffset:t.analysis.beatOffset, duration:t.duration,
           key:t.key, mode:t.mode, tag:t.tag, peaks:t.peaks};
 }
@@ -2028,7 +2035,7 @@ function App(){
         try{ rec=await dbGet(id); }catch{}
 
         let peaks, analysis, key, mode, tag, title, artist;
-        if(rec && rec.peaks && rec.bpm){
+        if(rec && rec.peaks && rec.bpm && rec.av===ANALYSIS_VERSION){
           setBusy(`Restoring ${f.name} (${i+1}/${audio.length})…`);
           ({title,artist,key,mode,tag}=rec);
           peaks=rec.peaks;
@@ -2072,17 +2079,34 @@ function App(){
       try{ recs=await dbGetAll(); }
       catch(err){ console.warn('library restore unavailable', err); return; }
       if(!recs.length || cancelled) return;
-      setBusy(`Restoring library (${recs.length})…`);
+      const stale=recs.filter(r=>r.av!==ANALYSIS_VERSION).length;
+      setBusy(stale ? `Re-analysing library (${stale} of ${recs.length})…`
+                    : `Restoring library (${recs.length})…`);
       const restored=[];
+      let done=0;
       for(const r of recs){
         if(cancelled) return;
         try{
           const buf=await E.ctx.decodeAudioData(await r.file.arrayBuffer());
+          let peaks=r.peaks, bpm=r.bpm, beatOffset=r.beatOffset, key=r.key, mode=r.mode;
+          if(r.av!==ANALYSIS_VERSION){
+            // Measured by an older analyser — redo it and write the result back,
+            // so the improvement reaches tracks imported before the change
+            // rather than only ones added afterwards.
+            done++;
+            setBusy(`Re-analysing library (${done} of ${stale})…`);
+            const res=await analyseTrack(buf,512);
+            peaks=res.peaks; bpm=res.tempo.bpm; beatOffset=res.tempo.beatOffset;
+            key=res.keyInfo.key; mode=res.keyInfo.mode;
+            try{
+              await dbPut({...r, av:ANALYSIS_VERSION, peaks, bpm, beatOffset, key, mode});
+            }catch(err){ console.warn('could not persist re-analysis', r.id, err); }
+          }
           restored.push({
-            id:r.id, file:r.file, buffer:buf, peaks:r.peaks,
-            analysis:{bpm:r.bpm, beatOffset:r.beatOffset},
-            title:r.title, artist:r.artist, bpm:r.bpm, duration:r.duration,
-            tag:r.tag||null, key:r.key, mode:r.mode
+            id:r.id, file:r.file, buffer:buf, peaks,
+            analysis:{bpm, beatOffset},
+            title:r.title, artist:r.artist, bpm, duration:r.duration,
+            tag:r.tag||null, key, mode
           });
         }catch(err){
           // Unreadable record (corrupt blob, codec no longer supported) —
