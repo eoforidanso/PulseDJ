@@ -498,6 +498,33 @@ function trackScore(current,cand){
 // cannot reach (bpmScore 0 — more than ±16% away even after octave folds)
 // is unmixable no matter how well its key fits, and the weighted sum alone
 // would still float it to the top on the strength of the key term.
+// Where auto-play should drop the needle. Starting every track at 0:00 means
+// a long silent lead-in or an ambient intro eats the whole blend — the mix
+// fades into nothing. Find the first point the waveform rises above a
+// fraction of its own peak, then snap BACK to the preceding beat so the
+// downbeat that follows lands on the grid rather than being clipped.
+// Reads the peak envelope that's already computed for the waveform display,
+// so this costs one pass over a few thousand buckets, not the samples.
+function firstBeatOffset(track){
+  const pk=track.peaks && track.peaks.peak;
+  const sr=track.buffer && track.buffer.sampleRate;
+  if(!pk || !pk.length || !sr || !track.bpm) return 0;
+  let max=0;
+  for(let i=0;i<pk.length;i++) if(pk[i]>max) max=pk[i];
+  if(max<=0) return 0;
+  const th=max*0.15;
+  let idx=-1;
+  for(let i=0;i<pk.length;i++){ if(pk[i]>=th){ idx=i; break; } }
+  if(idx<=0) return 0;                       // already loud from the top
+  const t=idx*track.peaks.bucketSamples/sr;
+  const bl=60/track.bpm;
+  const off=track.analysis ? track.analysis.beatOffset : 0;
+  const k=Math.floor((t-off)/bl);
+  const snapped=off+k*bl;
+  // Never skip so far in that there's no track left to mix.
+  return Math.max(0, Math.min(snapped, Math.max(0, track.duration-30)));
+}
+
 function pickNextTrack(current, pool, excludeIds){
   let best=null, bestScore=-Infinity;
   for(const t of pool){
@@ -1453,11 +1480,14 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
   // so a MIDI-mapped physical fader/button (driven from App(), which has no
   // access to this component's local state) moves the on-screen knob in step
   // instead of the two silently drifting apart.
+  // No dep array: re-created each render, so getEq closes over the current
+  // values rather than whatever they were when the deck mounted.
   useImperativeHandle(midiRef, ()=>({
     midiPitch: applyPitch,
     midiEq: setEqBand,
     midiFilter: setFilterKnob,
     midiSync: doSync,
+    getEq: ()=>eq,
   }));
 
   const setFxAmount=(v)=>{
@@ -2205,13 +2235,45 @@ function App(){
   // because progress is derived from elapsed time rather than accumulated per
   // tick, a throttled tick still lands on the right value and the blend still
   // finishes on schedule.
-  const autoCrossfade=(target,fadeSec,onDone)=>{
+  // Also performs the bass swap that makes the blend sound deliberate rather
+  // than muddy: two full-range basslines on top of each other is the single
+  // thing that most makes an automatic mix sound automatic. The incoming
+  // track comes in with its lows killed, and they trade places around the
+  // midpoint — the standard move, done by hand on every club mixer.
+  //
+  // The EQ is driven through the deck's own setter (the same one the MIDI
+  // path uses), so the on-screen LOW knobs visibly turn as it happens rather
+  // than the audio and the UI disagreeing.
+  const AUTO_BASS_KILL=-26;   // matches the LOW knob's floor
+  const autoCrossfade=({target, fadeSec, fromDeck, toDeck, onDone})=>{
     const start=Date.now();
     const from=xfadeRef.current;
+    const outRef=deckRefs[fromDeck], inRef=deckRefs[toDeck];
+    // Whatever the user had dialled in stays the destination — auto mode
+    // shouldn't quietly reset a deck's EQ to flat.
+    const outLow=(outRef.current&&outRef.current.getEq().low)||0;
+    const inLow=(inRef.current&&inRef.current.getEq().low)||0;
+    inRef.current&&inRef.current.midiEq('low',AUTO_BASS_KILL);
+    let lastSwap=-1;
     const iv=setInterval(()=>{
       const k=Math.min(1,(Date.now()-start)/(fadeSec*1000));
       setXfade(from+(target-from)*k);
-      if(k>=1){ clearInterval(iv); onDone && onDone(); }
+      // Swap centred on the midpoint, over the middle 30% of the blend.
+      const s=Math.max(0,Math.min(1,(k-0.35)/0.3));
+      if(s!==lastSwap){
+        lastSwap=s;
+        inRef.current&&inRef.current.midiEq('low', AUTO_BASS_KILL+(inLow-AUTO_BASS_KILL)*s);
+        outRef.current&&outRef.current.midiEq('low', outLow+(AUTO_BASS_KILL-outLow)*s);
+      }
+      if(k>=1){
+        clearInterval(iv);
+        // Hand the outgoing deck back with its own EQ intact — it's silent by
+        // now, so this is inaudible, and it stops a deck accumulating a killed
+        // bass that would silently ruin the next track loaded onto it.
+        outRef.current&&outRef.current.midiEq('low', outLow);
+        inRef.current&&inRef.current.midiEq('low', inLow);
+        onDone && onDone();
+      }
     },50);
     return ()=>clearInterval(iv);
   };
@@ -2246,6 +2308,7 @@ function App(){
           await loadTo(pick.track,'a');
           autoPlayed.current.add(pick.track.id);
           setXfade(0);            // hard left: deck A alone
+          E.a.seek(firstBeatOffset(pick.track));   // skip any silent lead-in
           E.a.play();
           force();
         } finally { autoBusy.current=false; }
@@ -2288,17 +2351,25 @@ function App(){
         await loadTo(pick.track,to);
         autoPlayed.current.add(pick.track.id);
         setAutoNext(pick.track);
+        // Drop in at the first beat, not 0:00, so a quiet intro doesn't get
+        // spent on the blend. Seek before play/sync: lockToLeader preserves
+        // the follower's own position (quantised to its grid), so the start
+        // point survives the beat-lock.
+        E[to].seek(firstBeatOffset(pick.track));
         E[to].play();
         // Beat-lock the incoming deck to the one already rolling. Same call
         // the SYNC button makes, so it inherits the octave-fold handling and
         // the ±16% range check.
         deckRefs[to].current?.midiSync();
         force();
-        autoCrossfade(to==='a'?0:1, fade, ()=>{
-          deck.pause();          // outgoing deck is silent by now — stop it
-          setAutoNext(null);
-          autoBusy.current=false;
-          force();
+        autoCrossfade({
+          target: to==='a'?0:1, fadeSec: fade, fromDeck: from, toDeck: to,
+          onDone: ()=>{
+            deck.pause();          // outgoing deck is silent by now — stop it
+            setAutoNext(null);
+            autoBusy.current=false;
+            force();
+          }
         });
       }catch(err){
         console.warn('auto-dj transition failed', err);
