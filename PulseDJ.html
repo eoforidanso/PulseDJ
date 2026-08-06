@@ -2213,6 +2213,7 @@ function App(){
   const [autoDj,setAutoDj]=useState(false);
   const [autoNext,setAutoNext]=useState(null);   // track queued for the next blend (display only)
   const autoBusy=useRef(false);                  // a transition is in flight — don't start another
+  const autoFadeCancel=useRef(null);             // aborts the blend in progress, if any
   const autoPlayed=useRef(new Set());            // ids played this session, so the set doesn't loop
 
   // Pool: the active crate if one is selected, otherwise the whole library.
@@ -2275,7 +2276,17 @@ function App(){
         onDone && onDone();
       }
     },50);
-    return ()=>clearInterval(iv);
+    // Abandon the blend where it stands (auto mode switched off mid-transition).
+    // The crossfader is left exactly where it is — that's a real mixer position,
+    // and snapping it either way would be a jump the user didn't ask for — but
+    // the bass kill is undone, because that was the automation's doing and not
+    // a setting anyone chose. onDone is deliberately NOT called: the outgoing
+    // deck keeps playing, so whoever just took over still has both hands on it.
+    return ()=>{
+      clearInterval(iv);
+      outRef.current&&outRef.current.midiEq('low', outLow);
+      inRef.current&&inRef.current.midiEq('low', inLow);
+    };
   };
 
   // Blend timings scaled to the outgoing track. The 12s lead / 8s fade suit a
@@ -2296,6 +2307,18 @@ function App(){
       if(autoBusy.current) return;
       const pool=autoPoolRef.current;
       if(!pool.length) return;
+
+      // Retire any deck sitting past the end of its buffer, whatever else is
+      // going on. The worklet keeps reporting `playing` off the end of a
+      // track, and a stopped-but-still-"live" deck poisons the counts below:
+      // two of them and the mid-set branch bows out as if the user were
+      // mixing by hand, so auto mode would wait forever on a deck that is
+      // never going to finish. Reachable in normal use by switching auto off
+      // mid-blend (which leaves both decks running, by design) and back on.
+      for(const w of ['a','b']){
+        const d=E[w];
+        if(d.playing && d.track && d.duration-d.position()<=0){ d.pause(); force(); }
+      }
 
       const live=['a','b'].filter(w=>E[w].playing && E[w].track);
 
@@ -2322,13 +2345,6 @@ function App(){
       const from=live[0], to=from==='a'?'b':'a';
       const deck=E[from];
       const remain=deck.duration-deck.position();
-
-      // Track has run off the end. The worklet keeps reporting `playing` past
-      // the end of the buffer, so without an explicit stop the deck sits
-      // "live" forever — live.length never falls back to 0, so the cold-start
-      // branch can never pick the set back up and auto mode is dead until the
-      // user intervenes. Stopping it here makes the stall self-healing.
-      if(remain<=0){ deck.pause(); force(); return; }
 
       const {fade,lead}=autoTimings(deck.duration);
       if(remain>lead) return;
@@ -2362,10 +2378,11 @@ function App(){
         // the ±16% range check.
         deckRefs[to].current?.midiSync();
         force();
-        autoCrossfade({
+        autoFadeCancel.current=autoCrossfade({
           target: to==='a'?0:1, fadeSec: fade, fromDeck: from, toDeck: to,
           onDone: ()=>{
             deck.pause();          // outgoing deck is silent by now — stop it
+            autoFadeCancel.current=null;
             setAutoNext(null);
             autoBusy.current=false;
             force();
@@ -2380,9 +2397,17 @@ function App(){
     return ()=>clearInterval(iv);
   },[autoDj]);
 
-  // Leaving auto mode clears the queued-track readout; the played-set is kept
-  // so re-enabling it continues the set rather than replaying from the top.
-  useEffect(()=>{ if(!autoDj){ autoBusy.current=false; setAutoNext(null); } },[autoDj]);
+  // Leaving auto mode hands control back at once: any blend in progress is
+  // abandoned where it stands rather than being allowed to play itself out,
+  // so the controls are yours the moment you hit the button. The played-set is
+  // kept, so switching auto back on continues the set instead of replaying it.
+  useEffect(()=>{
+    if(autoDj) return;
+    if(autoFadeCancel.current){ autoFadeCancel.current(); autoFadeCancel.current=null; }
+    autoBusy.current=false;
+    setAutoNext(null);
+    force();
+  },[autoDj]);
 
   // --- drag & drop ---
   useEffect(()=>{
@@ -2543,7 +2568,7 @@ function App(){
         </div>
         <button className={'btn auto'+(autoDj?' on':'')}
                 onClick={()=>{E.ctx.resume();setAutoDj(v=>!v);}}
-                title="Auto-DJ: mixes decks A/B hands-free, choosing each next track by tempo and key compatibility. C/D stay manual.">
+                title="Auto-DJ: mixes decks A/B hands-free, choosing each next track by tempo and key compatibility. C/D stay manual. Switching it off hands control back immediately, mid-blend if need be.">
           {autoDj?'■ AUTO ON':'✨ AUTO DJ'}
         </button>
         {autoDj && <span className="hint" style={{maxWidth:150,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
