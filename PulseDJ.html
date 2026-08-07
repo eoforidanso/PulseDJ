@@ -85,6 +85,10 @@
   .ttitle{font-weight:600;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .tsub{color:var(--dim);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .bpmbox{text-align:right;flex:0 0 auto}
+  /* tap-tempo + grid-phase nudge, beside the ×2/÷2 buttons */
+  .gridfix{display:flex;flex-direction:column;gap:3;flex:0 0 auto}
+  .gridfix .mini{padding:3px 6px}
+  .gridfix .mini:disabled{opacity:.35;cursor:not-allowed}
   .bpmval{font-variant-numeric:tabular-nums;font-weight:700;font-size:17px;line-height:1}
   .bpmlbl{font-size:9px;color:var(--dim);letter-spacing:1.2px}
 
@@ -931,13 +935,33 @@ class EngineDeck {
 
   // Octave correction. Tempo detection cannot reliably tell 87 from 174 on a
   // track whose pattern alternates every other beat, so the DJ gets the override.
+  // Replace the beat grid wholesale. Detection gets tracks wrong often enough
+  // that there has to be a way to correct it — and until now ×2/÷2 was the
+  // only one, which can't touch tempos that are merely wrong rather than
+  // octave-wrong, and can't fix the grid's phase at all.
+  //
+  // beatOffset is normalised into a single beat: only its position within the
+  // beat carries meaning, and letting it drift to large values would make the
+  // quantise arithmetic lose precision over a long track.
+  setGrid(bpm, beatOffset){
+    if(!bpm || bpm<40 || bpm>250) return false;
+    this.baseBpm=bpm;
+    this.link.bpm=bpm;
+    this.bpm=Math.round(bpm*this.link.speed*10)/10;
+    if(beatOffset!==undefined && beatOffset!==null){
+      const bl=60/bpm;
+      const off=((beatOffset%bl)+bl)%bl;
+      this.beatOffset=off;
+      this.link.beatOffset=off;
+    }
+    return true;
+  }
+
   scaleBpm(factor){
-    if(!this.baseBpm) return;
-    const next=this.baseBpm*factor;
-    if(next<40||next>250) return;
-    this.baseBpm=next;
-    this.link.bpm=next;
-    this.bpm=Math.round(next*this.link.speed*10)/10;
+    if(!this.baseBpm) return false;
+    // Halving/doubling keeps the grid's phase: the beats that were there are
+    // still beats, there are just twice as many or half as many.
+    return this.setGrid(this.baseBpm*factor, this.beatOffset);
   }
 
   setCue(){ this.cuePoint=this.position(); }
@@ -1487,7 +1511,7 @@ const fmtTime=(s)=>{
   return `${m}:${String(r).padStart(2,'0')}.${String(c).padStart(2,'0')}`;
 };
 
-const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fxItems}, midiRef){
+const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fxItems, onGridChange}, midiRef){
   const [,force]=useState(0);
   const [pitch,setPitch]=useState(0);           // percent
   const [eq,setEq]=useState({low:0,mid:0,high:0});
@@ -1657,6 +1681,56 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
     }
   };
 
+  /* --- beat grid correction: tap tempo + phase nudge ------------------
+     Detection is wrong often enough to need a manual override, and ×2/÷2
+     only ever helped with octave errors. These fix a tempo that's simply
+     wrong, and a grid whose phase sits off the beat. */
+
+  // Push the new grid to the engine, invalidate anything derived from it,
+  // and hand it up so it can be saved — a correction the user has to redo
+  // every session isn't worth much.
+  const applyGrid=(bpm,off)=>{
+    if(!deck.setGrid(bpm,off)) return;
+    // phraseAnchor is memoised off bpm/beatOffset, so it's stale now.
+    if(deck.track) delete deck.track._phraseAnchor;
+    if(onGridChange && deck.track) onGridChange(deck.track.id, deck.baseBpm, deck.beatOffset);
+    rerender(); bump();
+  };
+
+  const taps=useRef([]);
+  const [tapCount,setTapCount]=useState(0);
+  const doTap=()=>{
+    if(!deck.track) return;
+    const now=performance.now();
+    const a=taps.current;
+    // A pause longer than a slow beat means a new attempt, not a continuation.
+    if(a.length && now-a[a.length-1].t>3000) a.length=0;
+    // Record where in the track each tap landed, so the taps can set the
+    // grid's phase as well as its tempo — a tap IS a beat, which is exactly
+    // the information the phase is missing.
+    a.push({t:now, pos:deck.playing?deck.position():null});
+    if(a.length>8) a.shift();
+    setTapCount(a.length);
+    if(a.length<4) return;                 // too few to be worth trusting
+    const iv=[];
+    for(let i=1;i<a.length;i++) iv.push(a[i].t-a[i-1].t);
+    iv.sort((x,y)=>x-y);
+    const med=iv[Math.floor(iv.length/2)];  // median shrugs off one bad tap
+    const bpm=Math.round(60000/med*10)/10;
+    if(bpm<40||bpm>250) return;
+    const last=a[a.length-1];
+    applyGrid(bpm, last.pos!=null ? last.pos : undefined);
+  };
+  const resetTaps=()=>{ taps.current.length=0; setTapCount(0); };
+
+  // Shift the grid's phase without touching tempo, for a track whose BPM is
+  // right but whose downbeat sits a few milliseconds off.
+  const nudgeGrid=(dir)=>{
+    if(!deck.baseBpm || !deck.track) return;
+    const bl=60/deck.baseBpm;
+    applyGrid(deck.baseBpm, deck.beatOffset + dir*bl/50);   // ~10ms at 120 BPM
+  };
+
   const hotcue=(i,e)=>{
     if(e.shiftKey || e.altKey){ deck.hotcues[i]=null; rerender(); return; }
     if(deck.hotcues[i]==null) deck.hotcues[i]=deck.position();
@@ -1711,9 +1785,23 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
         </div>
         <div style={{display:'flex',flexDirection:'column',gap:3}}>
           <button className="mini" title="double the detected tempo"
-                  onClick={()=>{deck.scaleBpm(2);rerender();}}>×2</button>
+                  onClick={()=>{ if(deck.scaleBpm(2)) applyGrid(deck.baseBpm, deck.beatOffset); }}>×2</button>
           <button className="mini" title="halve the detected tempo"
-                  onClick={()=>{deck.scaleBpm(0.5);rerender();}}>÷2</button>
+                  onClick={()=>{ if(deck.scaleBpm(0.5)) applyGrid(deck.baseBpm, deck.beatOffset); }}>÷2</button>
+        </div>
+        <div className="gridfix">
+          <button className={'mini'+(tapCount?' on':'')}
+                  style={tapCount?{background:accent,color:'#000',borderColor:accent}:null}
+                  onClick={doTap} onDoubleClick={resetTaps} disabled={!deck.track}
+                  title="tap along with the beat — four taps or more sets the tempo, and while the deck is playing it sets the grid's phase too. Double-click to start over.">
+            TAP{tapCount?` ${tapCount}`:''}
+          </button>
+          <div style={{display:'flex',gap:3}}>
+            <button className="mini" onClick={()=>nudgeGrid(-1)} disabled={!deck.track}
+                    title="nudge the beat grid earlier">◀</button>
+            <button className="mini" onClick={()=>nudgeGrid(1)} disabled={!deck.track}
+                    title="nudge the beat grid later">▶</button>
+          </div>
         </div>
       </div>
 
@@ -2294,6 +2382,22 @@ function App(){
   // persist: without it the only way to reclaim the space is per-row, and a
   // library big enough to be worth clearing is exactly the one that's slow
   // to clear one row at a time.
+  // A tap-tempo or grid-nudge correction on a deck, written back to the
+  // library row and to storage. Without the write-back the fix would last
+  // only until the track was reloaded, which is no fix at all — and every
+  // downstream consumer (auto-play's tempo gate, phrase alignment, the BPM
+  // column) reads the library copy, not the deck's.
+  const updateGrid=(id,bpm,beatOffset)=>{
+    setLib(L=>L.map(t=>{
+      if(t.id!==id) return t;
+      const next={...t, bpm, analysis:{...t.analysis, bpm, beatOffset}};
+      delete next._phraseAnchor;   // derived from the grid that just changed
+      return next;
+    }));
+    dbGet(id).then(rec=>{ if(rec) return dbPut({...rec, bpm, beatOffset}); })
+             .catch(err=>console.warn('could not persist grid change', id, err));
+  };
+
   const clearLibrary=async()=>{
     if(!confirm(`Remove all ${lib.length} tracks from the library? Crates are kept, and anything already on a deck keeps playing.`)) return;
     const ids=lib.map(t=>t.id);
@@ -2795,7 +2899,7 @@ function App(){
 
       <div className="deckrows">
         <div className="decks">
-          <DeckPanel ref={refA} deck={E.a} id="A" accent="var(--a)" other={E.b} bump={force} fxItems={fxItems}/>
+          <DeckPanel ref={refA} deck={E.a} id="A" accent="var(--a)" other={E.b} bump={force} fxItems={fxItems} onGridChange={updateGrid}/>
 
           <div className="mixer">
             <div className="mxlabel" style={{borderTop:'none',marginTop:0}}>MASTER</div>
@@ -2841,11 +2945,11 @@ function App(){
             </div>
           </div>
 
-          <DeckPanel ref={refB} deck={E.b} id="B" accent="var(--b)" other={E.a} bump={force} fxItems={fxItems}/>
+          <DeckPanel ref={refB} deck={E.b} id="B" accent="var(--b)" other={E.a} bump={force} fxItems={fxItems} onGridChange={updateGrid}/>
         </div>
 
         <div className="decks">
-          <DeckPanel ref={refC} deck={E.c} id="C" accent="var(--c)" other={E.d} bump={force} fxItems={fxItems}/>
+          <DeckPanel ref={refC} deck={E.c} id="C" accent="var(--c)" other={E.d} bump={force} fxItems={fxItems} onGridChange={updateGrid}/>
 
           <div className="mixer">
             <div className="mxlabel" style={{borderTop:'none',marginTop:0}}>CHANNEL FADERS</div>
@@ -2885,7 +2989,7 @@ function App(){
             </div>
           </div>
 
-          <DeckPanel ref={refD} deck={E.d} id="D" accent="var(--d)" other={E.c} bump={force} fxItems={fxItems}/>
+          <DeckPanel ref={refD} deck={E.d} id="D" accent="var(--d)" other={E.c} bump={force} fxItems={fxItems} onGridChange={updateGrid}/>
         </div>
       </div>
 
