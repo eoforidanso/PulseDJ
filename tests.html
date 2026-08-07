@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>PULSE DJ — tests</title>
+<style>
+  :root{--bg:#08090c;--panel:#101319;--line:#232936;--txt:#e6ebf2;--dim:#7c8798;
+        --grn:#3ddc84;--red:#ff4d4d;--yel:#ffd400;--a:#00e5ff}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;padding:18px}
+  h1{font:800 15px/1 ui-sans-serif,system-ui;letter-spacing:3px;margin-bottom:4px;
+     background:linear-gradient(90deg,var(--a),#ff7a29);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{color:var(--dim);font-size:11px;margin-bottom:14px}
+  #summary{position:sticky;top:0;background:var(--bg);padding:10px 0;border-bottom:1px solid var(--line);
+    margin-bottom:12px;font-weight:700;font-size:14px}
+  .grp{margin:14px 0 6px;color:var(--a);font-weight:700;letter-spacing:1px}
+  .t{display:flex;gap:8px;padding:2px 0;align-items:baseline}
+  .t .mark{width:14px;flex:0 0 auto}
+  .pass .mark{color:var(--grn)} .fail .mark{color:var(--red)} .skip .mark{color:var(--yel)}
+  .fail{color:#ffb3b3}
+  .why{color:var(--dim);font-size:11px;padding-left:22px;white-space:pre-wrap}
+  .running{color:var(--yel)}
+</style>
+</head>
+<body>
+<h1>PULSE&nbsp;DJ — TESTS</h1>
+<div class="sub">
+  Pure mix logic from <code>engine/mixlogic.js</code>, plus the analysers in
+  <code>engine/analyzer.worker.js</code> run against synthesised audio.
+  Open over http:// (a worker and ES modules need a real origin).
+</div>
+<div id="summary" class="running">running…</div>
+<div id="out"></div>
+
+<script type="module">
+import * as M from './engine/mixlogic.js';
+
+/* ---- tiny runner: no dependencies, no build step ---- */
+const out=document.getElementById('out');
+let pass=0, fail=0, skip=0;
+const group=(name)=>{ const d=document.createElement('div'); d.className='grp'; d.textContent=name; out.appendChild(d); };
+function record(ok,name,why){
+  const d=document.createElement('div');
+  d.className='t '+(ok===null?'skip':ok?'pass':'fail');
+  d.innerHTML=`<span class="mark">${ok===null?'—':ok?'✓':'✗'}</span><span>${name}</span>`;
+  out.appendChild(d);
+  if(why){ const w=document.createElement('div'); w.className='why'; w.textContent=why; out.appendChild(w); }
+  if(ok===null) skip++; else ok?pass++:fail++;
+}
+const test=(name,fn)=>{ try{ fn(); record(true,name); }catch(e){ record(false,name,String(e.message||e)); } };
+const atest=async(name,fn)=>{ try{ await fn(); record(true,name); }catch(e){ record(false,name,String(e.message||e)); } };
+function eq(a,b,msg){ if(a!==b) throw new Error(`${msg||''} expected ${b}, got ${a}`); }
+function near(a,b,tol,msg){ if(!(Math.abs(a-b)<=tol)) throw new Error(`${msg||''} expected ${b}±${tol}, got ${a}`); }
+function ok(v,msg){ if(!v) throw new Error(msg||'expected truthy'); }
+
+/* ---- fixtures ---- */
+const T=(o={})=>Object.assign({id:'t'+Math.random(),bpm:128,key:'A',mode:'minor'},o);
+
+// A track-shaped object with a synthetic peak envelope, for the energy and
+// phrase functions, which read peaks rather than samples.
+function peakTrack({bucketSamples=512, sampleRate=44100, buckets=2000,
+                    level=()=>1, bpm=120, beatOffset=0, duration=null}={}){
+  const mk=()=>new Float32Array(buckets);
+  const peak=mk(), low=mk(), mid=mk(), high=mk();
+  for(let i=0;i<buckets;i++){
+    const v=level(i*bucketSamples/sampleRate, i);
+    peak[i]=v; low[i]=v; mid[i]=v*0.5; high[i]=v*0.25;
+  }
+  return {
+    id:'pk'+Math.random(), bpm, key:'A', mode:'minor',
+    peaks:{peak,low,mid,high,buckets,bucketSamples},
+    buffer:{sampleRate},
+    analysis:{bpm,beatOffset},
+    duration: duration!=null?duration:buckets*bucketSamples/sampleRate
+  };
+}
+
+/* ================= KEY / CAMELOT ================= */
+group('harmonic scoring');
+test('same key scores 1.0', ()=> eq(M.keyScore(T({key:'A',mode:'minor'}),T({key:'A',mode:'minor'})),1.0));
+test('relative major/minor scores 0.85', ()=> eq(M.keyScore(T({key:'A',mode:'minor'}),T({key:'C',mode:'major'})),0.85));
+test('one step round the wheel scores 0.8', ()=> eq(M.keyScore(T({key:'A',mode:'minor'}),T({key:'E',mode:'minor'})),0.8));
+test('wheel wraps 1A <-> 12A', ()=> eq(M.keyScore(T({key:'Ab',mode:'minor'}),T({key:'C#',mode:'minor'})),0.8));
+test('unrelated keys score 0.25', ()=> eq(M.keyScore(T({key:'A',mode:'minor'}),T({key:'D#',mode:'minor'})),0.25));
+test('unknown key is neutral, not a clash', ()=>{
+  eq(M.keyScore(T({key:null,mode:null}),T({key:'C',mode:'major'})),0.5);
+  eq(M.keyScore(T({key:null,mode:null}),T({key:null,mode:null})),0.5);
+});
+test('camelotOf maps A minor to 8A', ()=> eq(M.camelotOf(T({key:'A',mode:'minor'})),'8A'));
+test('camelotOf returns null for an unknown key', ()=> eq(M.camelotOf(T({key:null,mode:null})),null));
+test('every Camelot slot is reachable', ()=>{
+  const slots=new Set(Object.values(M.CAMELOT));
+  eq(slots.size,24,'distinct wheel positions:');
+});
+
+/* ================= TEMPO ================= */
+group('tempo scoring');
+test('exact tempo scores 1.0', ()=> eq(M.bpmScore(128,128),1));
+test('double time folds to a perfect match', ()=> eq(M.bpmScore(70,140),1));
+test('half time folds to a perfect match', ()=> eq(M.bpmScore(140,70),1));
+test('the pitch-range edge scores 0', ()=> eq(M.bpmScore(100,116),0));
+test('beyond pitch range scores 0', ()=> eq(M.bpmScore(100,130),0));
+test('halfway to the limit scores 0.5', ()=> near(M.bpmScore(100,108),0.5,1e-9));
+test('missing tempo is neutral', ()=>{ eq(M.bpmScore(0,128),0.5); eq(M.bpmScore(128,0),0.5); });
+
+/* ================= SELECTION ================= */
+group('track selection');
+test('prefers the harmonic match over a perfect tempo clash', ()=>{
+  const cur=T({bpm:128,key:'A',mode:'minor'});
+  const clash=T({id:'clash',bpm:128,key:'D#',mode:'minor'});
+  const good =T({id:'good', bpm:130,key:'C', mode:'major'});
+  eq(M.pickNextTrack(cur,[clash,good],new Set()).track.id,'good');
+});
+test('an unmixable tempo is rejected outright, however good the key', ()=>{
+  // The regression this guards: trackScore is a weighted sum, so a track SYNC
+  // physically cannot reach still scored 0.4 on its key alone and won the pick.
+  const cur=T({bpm:128,key:'A',mode:'minor'});
+  const unreachable=T({id:'slow',bpm:100,key:'A',mode:'minor'});
+  eq(M.pickNextTrack(cur,[unreachable],new Set()),null);
+});
+test('skips the unreachable one in favour of a worse-keyed but mixable track', ()=>{
+  const cur=T({bpm:128,key:'A',mode:'minor'});
+  const unreachable=T({id:'slow',bpm:100,key:'A',mode:'minor'});
+  const reachable  =T({id:'far', bpm:128,key:'D#',mode:'minor'});
+  eq(M.pickNextTrack(cur,[unreachable,reachable],new Set()).track.id,'far');
+});
+test('honours the exclusion set', ()=>{
+  const cur=T({bpm:128});
+  const a=T({id:'a',bpm:128}), b=T({id:'b',bpm:128});
+  eq(M.pickNextTrack(cur,[a,b],new Set(['a'])).track.id,'b');
+  eq(M.pickNextTrack(cur,[a,b],new Set(['a','b'])),null);
+});
+test('cold start (no current track) still returns a pick', ()=>{
+  eq(M.pickNextTrack(null,[T({id:'x',bpm:90})],new Set()).track.id,'x');
+});
+test('an empty pool yields null rather than throwing', ()=>{
+  eq(M.pickNextTrack(T({bpm:128}),[],new Set()),null);
+});
+
+/* ================= ENERGY ================= */
+group('energy');
+test('normalised energy is blind to overall level (by design)', ()=>{
+  const loud =peakTrack({level:()=>0.8});
+  const quiet=peakTrack({level:()=>0.2});
+  near(M.sectionEnergy(loud,0,10), M.sectionEnergy(quiet,0,10), 1e-6,
+       'both sit at their own peak:');
+});
+test('raw energy does see level — the cross-track comparison', ()=>{
+  // The bug this guards: energyScore originally used the normalised curve, so
+  // a track 12dB down scored as a perfect match. Level is exactly the thing
+  // that must survive for a junction comparison.
+  const loud =peakTrack({level:()=>0.8});
+  const quiet=peakTrack({level:()=>0.2});
+  ok(M.rawSectionEnergy(loud,0,10) > 3*M.rawSectionEnergy(quiet,0,10),
+     'raw energy should scale with level');
+});
+test('a level-matched junction scores well', ()=>{
+  const a=peakTrack({level:()=>0.6}), b=peakTrack({level:()=>0.6});
+  ok(M.energyScore(a,b)>0.7, 'got '+M.energyScore(a,b));
+});
+test('a large energy drop is rejected', ()=>{
+  const a=peakTrack({level:()=>0.8}), b=peakTrack({level:()=>0.2});
+  near(M.energyScore(a,b),0,1e-9);
+});
+test('a slight lift beats staying exactly level', ()=>{
+  const a=peakTrack({level:()=>0.6});
+  const same=peakTrack({level:()=>0.6});
+  const lift=peakTrack({level:()=>0.6*Math.pow(10,1.5/20)});   // +1.5dB
+  ok(M.energyScore(a,lift) > M.energyScore(a,same),
+     `lift ${M.energyScore(a,lift)} vs same ${M.energyScore(a,same)}`);
+});
+test('missing peaks fall back to neutral', ()=>{
+  eq(M.energyScore(T(),T()),0.5);
+});
+
+/* ================= PHRASE STRUCTURE ================= */
+group('phrase structure');
+test('the grid anchors to the biggest energy jump', ()=>{
+  const bpm=120, drop=16.0;
+  const t=peakTrack({bpm, buckets:5200, level:(sec)=> sec<drop?0.08:0.9});
+  const phrase=M.PHRASE_BEATS*(60/bpm);
+  const a=M.phraseAnchor(t);
+  const k=Math.round((drop-a)/phrase);
+  near(a+k*phrase, drop, 0.15, 'grid boundary vs the drop:');
+});
+test('a featureless track falls back to beatOffset', ()=>{
+  const t=peakTrack({level:()=>0.5, beatOffset:0.07});
+  near(M.phraseAnchor(t),0.07,1e-9);
+});
+test('nextPhrase lands on a boundary and never goes backwards', ()=>{
+  const t=peakTrack({bpm:120, level:()=>0.5});
+  const P=M.PHRASE_BEATS*0.5, a=M.phraseAnchor(t);
+  for(const at of [0,3.2,7.9,8.0,25.5]){
+    const n=M.nextPhrase(t,at);
+    ok(n>=at-1e-9, `nextPhrase(${at}) went backwards to ${n}`);
+    near(((n-a)%P+P)%P, 0, 1e-6, `nextPhrase(${at})=${n} off-grid:`);
+  }
+});
+test('snapToPhrase picks the nearer boundary', ()=>{
+  const t=peakTrack({bpm:120, level:()=>0.5});
+  const P=M.PHRASE_BEATS*0.5;                 // 8s
+  near(M.snapToPhrase(t,0.4),0,0.05);
+  near(M.snapToPhrase(t,7.6),P,0.05);
+});
+test('snapToPhrase never returns a negative position', ()=>{
+  const t=peakTrack({bpm:120, level:()=>0.5});
+  ok(M.snapToPhrase(t,-5)>=0);
+});
+
+/* ================= START POINT ================= */
+group('start point');
+test('a silent lead-in is skipped', ()=>{
+  const t=peakTrack({bpm:120, buckets:5200, level:(sec)=> sec<8?0.001:0.9});
+  const off=M.firstBeatOffset(t);
+  ok(off>4 && off<=8.05, 'expected just before the audio, got '+off);
+});
+test('a track loud from the start is not skipped', ()=>{
+  eq(M.firstBeatOffset(peakTrack({level:()=>0.9})),0);
+});
+test('silence throughout yields 0 rather than a guess', ()=>{
+  eq(M.firstBeatOffset(peakTrack({level:()=>0})),0);
+});
+test('missing peaks yield 0', ()=>{
+  eq(M.firstBeatOffset({bpm:128,duration:100}),0);
+});
+test('never skips so far that nothing is left to mix', ()=>{
+  // 34s track whose audio only starts at 30s: must be clamped.
+  const t=peakTrack({bpm:120, buckets:2929, duration:34, level:(sec)=> sec<30?0:0.9});
+  ok(M.firstBeatOffset(t)<=4.01, 'got '+M.firstBeatOffset(t));
+});
+
+/* ================= TRACK ID ================= */
+group('track identity');
+test('the id is derived from content, not chance', ()=>{
+  // The bug this guards: ids were Math.random(), so every saved crate came
+  // back pointing at tracks that could never exist again.
+  const f={name:'Artist - Title.mp3', size:8123456};
+  eq(M.trackKey(f), M.trackKey({...f}));
+});
+test('a different file gets a different id', ()=>{
+  ok(M.trackKey({name:'A.mp3',size:100}) !== M.trackKey({name:'B.mp3',size:100}));
+  ok(M.trackKey({name:'A.mp3',size:100}) !== M.trackKey({name:'A.mp3',size:101}));
+});
+test('the id is filesystem/JSON safe', ()=>{
+  ok(/^[a-z0-9-]+$/.test(M.trackKey({name:'Ünïcødé — ✨.flac',size:42})));
+});
+
+/* ================= ANALYSERS (worker, synthesised audio) ================= */
+group('analysers — tempo & key on synthesised audio');
+
+const SR=44100;
+function renderTrack({bpm=120, tonic=9, mode='minor', dur=24, level=1}={}){
+  const bl=60/bpm, n=Math.floor(SR*dur), ch=new Float32Array(n);
+  const semis = mode==='major'?[0,4,7]:[0,3,7];
+  const fOf=(pc,oct)=>440*Math.pow(2,((pc-9)+12*(oct-4))/12);
+  for(let i=0;i<n;i++){
+    const t=i/SR, bt=t%bl, env=Math.exp(-bt*6);
+    let v=Math.sin(2*Math.PI*fOf(tonic,2)*t)*0.5;
+    for(const s of semis) v+=Math.sin(2*Math.PI*fOf((tonic+s)%12,4)*t)*0.22;
+    for(const s of semis) v+=Math.sin(2*Math.PI*fOf((tonic+s)%12,5)*t)*0.11;
+    v*=env;
+    v+=(Math.random()*2-1)*Math.exp(-bt*160)*0.8;   // broadband transient
+    ch[i]=v*level*0.4;
+  }
+  return ch;
+}
+
+let worker=null, seq=0;
+const pending=new Map();
+function analyse(ch){
+  if(!worker){
+    worker=new Worker('./engine/analyzer.worker.js');
+    worker.onmessage=(e)=>{ const p=pending.get(e.data.reqId); if(!p) return;
+      pending.delete(e.data.reqId); e.data.ok?p.res(e.data):p.rej(new Error(e.data.error)); };
+    worker.onerror=(err)=>{ for(const p of pending.values()) p.rej(new Error(err.message||'worker failed')); pending.clear(); };
+  }
+  const reqId=++seq, copy=ch.slice();
+  return new Promise((res,rej)=>{
+    pending.set(reqId,{res,rej});
+    worker.postMessage({reqId, channels:[copy], sampleRate:SR, length:copy.length,
+                        duration:copy.length/SR, bucketSamples:512}, [copy.buffer]);
+  });
+}
+
+const NOTES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+await atest('tempo is detected on rhythmic material', async()=>{
+  const r=await analyse(renderTrack({bpm:120}));
+  near(r.tempo.bpm,120,1.5,'detected tempo:');
+});
+await atest('tempo is independent of the key played', async()=>{
+  const a=await analyse(renderTrack({bpm:120,tonic:9}));
+  const b=await analyse(renderTrack({bpm:120,tonic:3}));
+  near(a.tempo.bpm,b.tempo.bpm,1.0,'same rhythm, different key:');
+});
+await atest('key is detected across all 12 tonics, both modes', async()=>{
+  // This is the suite that caught the old detector at 4/24.
+  const misses=[];
+  for(let pc=0;pc<12;pc++){
+    for(const mode of ['major','minor']){
+      const r=await analyse(renderTrack({tonic:pc,mode}));
+      const got=`${r.keyInfo.key} ${r.keyInfo.mode}`, want=`${NOTES[pc]} ${mode}`;
+      if(got!==want) misses.push(`${want} -> ${got}`);
+    }
+  }
+  if(misses.length) throw new Error(`${24-misses.length}/24 correct. Misses:\n  `+misses.join('\n  '));
+});
+await atest('atonal material reports no key rather than guessing', async()=>{
+  const n=SR*20, ch=new Float32Array(n);
+  for(let i=0;i<n;i++){ const bt=(i/SR)%0.5; ch[i]=(Math.random()*2-1)*Math.exp(-bt*18)*0.6; }
+  const r=await analyse(ch);
+  eq(r.keyInfo.key,null,'percussion-only key:');
+});
+await atest('peak envelope covers the whole track', async()=>{
+  const dur=24, r=await analyse(renderTrack({dur}));
+  const expected=Math.ceil(SR*dur/512);
+  eq(r.peaks.buckets,expected);
+  ok(r.peaks.peak.some(v=>v>0.05),'envelope should carry signal');
+});
+
+/* ---- summary ---- */
+const s=document.getElementById('summary');
+s.className='';
+s.innerHTML = fail
+  ? `<span style="color:var(--red)">${fail} failed</span> · ${pass} passed${skip?` · ${skip} skipped`:''}`
+  : `<span style="color:var(--grn)">all ${pass} passed</span>${skip?` · ${skip} skipped`:''}`;
+document.title = (fail?`✗ ${fail} failing`:`✓ ${pass} passing`)+' — PULSE DJ tests';
+window.__results={pass,fail,skip};
+</script>
+</body>
+</html>
