@@ -46,6 +46,18 @@
   /* touch drags on jog wheels / faders must not scroll or select the page */
   .platter,.pitch,.vol,.xf,.knobwrap svg,.wave-main,.wave-nav{touch-action:none}
 
+  /* Keyboard focus. Restyling nearly every control suppresses the platform
+     focus ring, which leaves keyboard users with no idea where they are.
+     :focus-visible keeps it to keyboard interaction, so pointer users never
+     see it. */
+  :focus-visible{outline:2px solid var(--a);outline-offset:2px;border-radius:4px}
+  .knobwrap svg:focus-visible{outline-offset:3px}
+  /* Anything conveying state through colour alone also gets a shape cue, for
+     colour-blind users and for anyone on a washed-out projector. */
+  .lbtn.on::after,.fxlbtn.on::after{content:'';position:absolute;inset:auto 3px 2px auto;
+    width:4px;height:4px;border-radius:50%;background:currentColor}
+  .lbtn,.fxlbtn{position:relative}
+
   /* ---- top bar ---- */
   .topbar{display:flex;align-items:center;gap:14px;padding:8px 14px;background:var(--panel);
     border-bottom:1px solid var(--line);flex:0 0 auto}
@@ -902,6 +914,34 @@ function Knob({value,min,max,onChange,label,fmt,color,size=38,center=false}){
     window.addEventListener('pointerup',up);
   };
 
+  // Keyboard operation. A knob is a slider, so it gets the arrow/page/home/end
+  // keys a slider is expected to answer to — without them ~30 controls per
+  // screen were reachable only with a pointer.
+  //
+  // stopPropagation matters as much as the handler: the app's global shortcuts
+  // live on window and bind the arrow keys to the crossfader, so without it
+  // nudging a focused knob would slide the crossfader at the same time.
+  const step=(max-min)/100;
+  const nudge=(mult,e)=>{
+    e.preventDefault(); e.stopPropagation();
+    onChange(Math.max(min,Math.min(max, value+step*mult)));
+  };
+  const onKeyDown=(e)=>{
+    const fine=e.shiftKey?0.25:1;
+    switch(e.key){
+      case 'ArrowUp': case 'ArrowRight': return nudge(fine,e);
+      case 'ArrowDown': case 'ArrowLeft': return nudge(-fine,e);
+      case 'PageUp':   return nudge(10,e);
+      case 'PageDown': return nudge(-10,e);
+      case 'Home': e.preventDefault(); e.stopPropagation(); return onChange(min);
+      case 'End':  e.preventDefault(); e.stopPropagation(); return onChange(max);
+      case 'Enter': case ' ':
+        // Same as double-click: back to the neutral position.
+        e.preventDefault(); e.stopPropagation();
+        return onChange(center?(min+max)/2:max);
+    }
+  };
+
   const t=(value-min)/(max-min);
   const ang=-135+t*270;
   const r=size/2;
@@ -935,7 +975,11 @@ function Knob({value,min,max,onChange,label,fmt,color,size=38,center=false}){
     <div className="knobwrap">
       <svg ref={ref} width={size} height={size} onPointerDown={down}
            style={{cursor:'ns-resize',touchAction:'none',overflow:'visible'}}
-           onDoubleClick={()=>onChange(center?(min+max)/2:max)}>
+           onDoubleClick={()=>onChange(center?(min+max)/2:max)}
+           onKeyDown={onKeyDown}
+           tabIndex={0} role="slider" aria-label={label}
+           aria-valuemin={min} aria-valuemax={max} aria-valuenow={Math.round(value*100)/100}
+           aria-valuetext={fmt?fmt(value):undefined}>
         <defs>
           <radialGradient id={gradId} cx="38%" cy="32%" r="75%">
             <stop offset="0%" stopColor="rgba(255,255,255,0.08)"/>
@@ -1206,7 +1250,7 @@ function WaveMain({deck, accent}){
     }
     scrub.current=null;
   };
-  return <div className="wave-main" onPointerDown={down} onPointerMove={move}
+  return <div className="wave-main" aria-hidden="true" onPointerDown={down} onPointerMove={move}
               onPointerUp={up} onPointerCancel={up}><canvas ref={ref}/></div>;
 }
 
@@ -1250,7 +1294,7 @@ function WaveNav({deck, accent}){
     const r=e.currentTarget.getBoundingClientRect();
     d.seek((e.clientX-r.left)/r.width*d.duration);
   };
-  return <div className="wave-nav" onClick={jump}><canvas ref={ref}/></div>;
+  return <div className="wave-nav" aria-hidden="true" onClick={jump}><canvas ref={ref}/></div>;
 }
 
 /* ============================================================
@@ -1519,7 +1563,7 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
   const effPitch = ui.sync ? (deck.rate-1)*100 : pitch;
 
   return (
-    <div className="deck">
+    <div className="deck" role="group" aria-label={`Deck ${id}`}>
       <div className="dhead">
         <div className="dbadge" style={{background:accent}}>{id}</div>
         <div className="tinfo">
@@ -1562,7 +1606,8 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
 
       <div className="dbody">
         <div className="platter-col">
-          <div className="platter" ref={platterRef} onPointerDown={platterDown}>
+          <div className="platter" ref={platterRef} onPointerDown={platterDown}
+               aria-hidden="true">
             <div className="mark" style={{background:accent, transform:`rotate(${rot}deg)`}}/>
             <div className="hub"/>
           </div>
@@ -1572,6 +1617,7 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
         <div className="ctrls">
           <div className="row">
             <button className={'tbtn play'+(ui.playing?' on':'')}
+                    aria-pressed={ui.playing} aria-label={`Deck ${id} ${ui.playing?'pause':'play'}`}
                     onClick={()=>{deck.toggle();bump();}}>
               {ui.playing?'❚❚ PAUSE':'▶ PLAY'}
             </button>
@@ -1579,11 +1625,13 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
                     onPointerDown={()=>{ if(!deck.playing){deck.setCue();} deck.toCue(); deck.play(); bump(); }}
                     onPointerUp={()=>{ deck.pause(); deck.toCue(); bump(); }}>CUE</button>
             <button className={'tbtn sync'+(ui.sync?' on':'')} onClick={doSync}
+                    aria-pressed={ui.sync} aria-label={`Deck ${id} sync`}
                     style={syncFail?{background:'var(--red)',color:'#fff',borderColor:'var(--red)'}:null}
                     title={`match tempo to the other deck and keep it phase-locked (within ±${PITCH_RANGE}%)`}>
               {syncFail?'OUT OF RANGE':'SYNC'}
             </button>
             <button className={'tbtn'+(ui.slipping?' on':'')} onClick={()=>{ ui.slipping?deck.slipOff():deck.slipOn(); rerender(); }}
+                    aria-pressed={ui.slipping} aria-label={`Deck ${id} slip mode`}
                     style={ui.slipping?{background:'var(--yel)',color:'#000',borderColor:'var(--yel)'}:null}
                     title="slip mode: seeks/hotcues/loops play a temporary detour — the real position keeps advancing underneath and playback snaps back to it when you turn slip off">
               SLIP
@@ -1593,6 +1641,7 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
           <div className="row" style={{gap:6}}>
             <span className="hint" style={{alignSelf:'center'}}>HOTCUES</span>
             <button className={'mini'+(quantized?' on':'')}
+                    aria-pressed={quantized} aria-label={`Deck ${id} quantise`}
                     style={quantized?{background:accent,color:'#000',borderColor:accent}:null}
                     onClick={toggleQuantize}
                     title="ON: hotcue/loop jumps snap to the next beat. OFF: jump immediately, mid-beat.">
@@ -1603,6 +1652,7 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
           <div className="cues">
             {deck.hotcues.map((c,i)=>(
               <button key={i} className={'hcue'+(c!=null?' set':'')}
+                      aria-label={`Deck ${id} hotcue ${i+1}${c!=null?`, set at ${fmtTime(c)}`:', empty'}`}
                       style={c!=null?{background:CUE_COLORS[i],borderColor:CUE_COLORS[i]}:null}
                       onClick={(e)=>hotcue(i,e)}
                       title={c!=null?'click to jump · shift-click to clear':'click to set'}>
@@ -1614,6 +1664,8 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
           <div className="loops">
             {[1,2,4,8].map(b=>(
               <button key={b}
+                      aria-pressed={!!(deck.loop&&deck.loop.beats===b&&!deck.rolling)}
+                      aria-label={`Deck ${id} ${b} beat loop`}
                       className={'lbtn'+(deck.loop&&deck.loop.beats===b&&!deck.rolling?' on':'')}
                       onClick={()=>{ deck.loop&&deck.loop.beats===b?deck.clearLoop():deck.setLoop(b); rerender(); }}>
                 {b}
@@ -1641,6 +1693,7 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
               const isCurrent=active && ui.pos>=stepStart && ui.pos<stepStart+stepLen;
               return (
                 <button key={i} className={'spad'+(isCurrent?' on':'')}
+                        aria-label={`Deck ${id} loop slice ${i+1} of 8`}
                         style={isCurrent?{background:accent,borderColor:accent}:null}
                         disabled={!active}
                         onClick={()=>{ deck.jumpTo(stepStart); rerender(); }}>
@@ -1660,6 +1713,7 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
             <div style={{display:'flex',flexDirection:'column',gap:4}}>
               {['delay','reverb','flanger','phaser','echo'].map(ty=>(
                 <button key={ty} className={'mini'+(fx.type===ty?' on':'')}
+                        aria-pressed={fx.type===ty}
                         style={fx.type===ty?{background:accent,color:'#000',borderColor:accent}:null}
                         onClick={()=>setFxType(ty)}
                         title={ty===('delay')?'Delay (tempo-synced)':ty===('reverb')?'Reverb (spatial)':ty===('flanger')?'Flanger (sweep)':ty===('phaser')?'Phaser (notch filter)':'Echo (long delay)'}
@@ -1683,7 +1737,7 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
 
           <div className="fxslot">
             <div className="knoblbl">FX SLOT</div>
-            <select className="fxsel" value={fxId} onChange={e=>{deck.stopFx();setFxLoop(0);setFxId(e.target.value);}}
+            <select className="fxsel" value={fxId} aria-label={`Deck ${id} FX slot sample`} onChange={e=>{deck.stopFx();setFxLoop(0);setFxId(e.target.value);}}
                     style={fxItem&&fxItem.tag?{borderColor:TAG_COLORS[fxItem.tag]}:null}
                     title={fxItem?fxItem.title:'tag an FX file in the library to load it here'}>
               <option value="">— none —</option>
@@ -1696,6 +1750,8 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
             <div className="fxloops">
               {[1,2,4].map(b=>(
                 <button key={b} className={'fxlbtn'+(fxLoop===b?' on':'')}
+                        aria-pressed={fxLoop===b}
+                        aria-label={`Loop FX sample for ${b} beat${b>1?'s':''}`}
                         onClick={()=>fxLoopToggle(b)} disabled={!fxItem}
                         title={`loop the sample for ${b} beat${b>1?'s':''} (tap again to stop)`}>{b}</button>
               ))}
@@ -1709,9 +1765,12 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
             {effPitch>0?'+':''}{effPitch.toFixed(1)}%
           </div>
           <input className="pitch" type="range" min={-PITCH_RANGE} max={PITCH_RANGE} step="0.02"
+                 aria-label={`Deck ${id} pitch`}
+                 aria-valuetext={`${effPitch>0?'+':''}${effPitch.toFixed(1)} percent`}
                  value={effPitch} onChange={e=>applyPitch(parseFloat(e.target.value))}/>
           <button className="mini" onClick={()=>applyPitch(0)}>RESET</button>
           <button className="mini" onClick={toggleKeylock}
+                  aria-pressed={keylock} aria-label={`Deck ${id} key lock`}
                   style={keylock?{background:accent,color:'#000',borderColor:accent}:null}
                   title="ON: change tempo without shifting pitch (time-stretch). OFF: classic linked pitch/tempo, like vinyl.">
             KEY {keylock?'LOCK':'OFF'}
@@ -1733,11 +1792,39 @@ const DeckPanel=forwardRef(function DeckPanel({deck, id, accent, other, bump, fx
 function MidiPanel({devices, map, learn, onLearn, onClear, onClearAll, onClose}){
   const fmtBinding=(b)=> b ? `CH${b.channel+1} ${b.type==='cc'?'CC':'NOTE'} ${b.number}` : '—';
   const groups=[['A','a'],['B','b'],['C','c'],['D','d'],['MASTER','']];
+  const panelRef=useRef(null);
+  const restoreTo=useRef(null);
+
+  // Modal behaviour a dialog is expected to have: Escape closes it, focus
+  // moves inside on open and returns to whatever opened it on close, and Tab
+  // stays within the panel rather than wandering the decks behind it.
+  useEffect(()=>{
+    restoreTo.current=document.activeElement;
+    const first=panelRef.current&&panelRef.current.querySelector('button');
+    if(first) first.focus();
+    const onKey=(e)=>{
+      if(e.key==='Escape'){ e.preventDefault(); e.stopPropagation(); onClose(); return; }
+      if(e.key!=='Tab') return;
+      const f=[...panelRef.current.querySelectorAll('button:not([disabled])')];
+      if(!f.length) return;
+      const lo=f[0], hi=f[f.length-1];
+      if(e.shiftKey && document.activeElement===lo){ e.preventDefault(); hi.focus(); }
+      else if(!e.shiftKey && document.activeElement===hi){ e.preventDefault(); lo.focus(); }
+    };
+    window.addEventListener('keydown',onKey,true);
+    return ()=>{
+      window.removeEventListener('keydown',onKey,true);
+      const el=restoreTo.current;
+      if(el && el.focus) el.focus();
+    };
+  },[]);
+
   return (
     <div className="midibackdrop" onClick={onClose}>
-      <div className="midipanel" onClick={e=>e.stopPropagation()}>
+      <div className="midipanel" onClick={e=>e.stopPropagation()} ref={panelRef}
+           role="dialog" aria-modal="true" aria-labelledby="midi-title">
         <div className="midihead">
-          <h3>MIDI MAPPING</h3>
+          <h3 id="midi-title">MIDI MAPPING</h3>
           <span className="hint">
             {devices.length ? `connected: ${devices.join(', ')}` : 'no MIDI devices detected — connect a controller'}
           </span>
@@ -1754,11 +1841,14 @@ function MidiPanel({devices, map, learn, onLearn, onClear, onClearAll, onClose})
                   <span className="midilbl">{c.label}</span>
                   <span className="midival">{learn===c.id ? 'listening…' : fmtBinding(map[c.id])}</span>
                   <button className={'mini'+(learn===c.id?' on':'')}
+                          aria-pressed={learn===c.id}
+                          aria-label={`${learn===c.id?'Cancel learning':'Learn'} ${c.label}`}
                           style={learn===c.id?{background:'var(--yel)',color:'#000',borderColor:'var(--yel)'}:null}
                           onClick={()=>onLearn(learn===c.id?null:c.id)}>
                     {learn===c.id?'CANCEL':'LEARN'}
                   </button>
-                  <button className="mini" disabled={!map[c.id]} onClick={()=>onClear(c.id)}>✕</button>
+                  <button className="mini" disabled={!map[c.id]} onClick={()=>onClear(c.id)}
+                          aria-label={`Clear mapping for ${c.label}`}>✕</button>
                 </div>
               ))}
             </div>
@@ -2615,13 +2705,13 @@ function App(){
         <button className="btn" onClick={()=>fileInput.current.click()}>+ ADD TRACKS</button>
         <input ref={fileInput} type="file" accept="audio/*" multiple hidden
                onChange={e=>{ingest(e.target.files); e.target.value='';}}/>
-        <span className="hint">{busy || 'drag audio files anywhere · Q/P play A/B · W/O cue · A·S·D play/cue C · L·K·J play/cue D · 1-4 & 7-0 hotcues · ←/→ crossfade A/B · space slam'}</span>
+        <span className="hint" role="status" aria-live="polite">{busy || 'drag audio files anywhere · Q/P play A/B · W/O cue · A·S·D play/cue C · L·K·J play/cue D · 1-4 & 7-0 hotcues · ←/→ crossfade A/B · space slam'}</span>
         <div className="spacer"/>
         <div className="master-meter" ref={masterRef}>
           {Array.from({length:12},(_,i)=>
             <div key={i} style={{width:4,height:4+i*1,background:'#1a1f28',borderRadius:1}}/>)}
         </div>
-        <button className={'btn auto'+(autoDj?' on':'')}
+        <button className={'btn auto'+(autoDj?' on':'')} aria-pressed={autoDj}
                 onClick={()=>{E.ctx.resume();setAutoDj(v=>!v);}}
                 title="Auto-DJ: mixes decks A/B hands-free, choosing each next track by tempo and key compatibility. C/D stay manual. Switching it off hands control back immediately, mid-blend if need be.">
           {autoDj?'■ AUTO ON':'✨ AUTO DJ'}
@@ -2630,7 +2720,8 @@ function App(){
           {autoNext?`→ ${autoNext.title}${autoNext._beats?` · ${autoNext._beats} beats`:''}`
                    :`${autoPool.length} in pool`}
         </span>}
-        <button className={'btn rec'+(recording?' on':'')} onClick={toggleRec}>
+        <button className={'btn rec'+(recording?' on':'')} onClick={toggleRec}
+                aria-pressed={recording} aria-label={recording?'Stop recording':'Record mix'}>
           {recording?'■ STOP REC':'● REC MIX'}
         </button>
         <button className={'btn'+(midiDevices.length?' on':'')} onClick={()=>setMidiOpen(true)}
@@ -2666,6 +2757,7 @@ function App(){
                 <div className="vpair">
                   <Meter getLevel={()=>E.a.level()}/>
                   <input className="vol" type="range" min="0" max="1" step="0.01"
+                         aria-label="Deck A channel fader"
                          value={volA} onChange={e=>setVolA(parseFloat(e.target.value))}/>
                 </div>
                 <div className="knoblbl" style={{color:'var(--a)'}}>A</div>
@@ -2673,6 +2765,7 @@ function App(){
               <div className="vslot">
                 <div className="vpair">
                   <input className="vol" type="range" min="0" max="1" step="0.01"
+                         aria-label="Deck B channel fader"
                          value={volB} onChange={e=>setVolB(parseFloat(e.target.value))}/>
                   <Meter getLevel={()=>E.b.level()}/>
                 </div>
@@ -2682,6 +2775,7 @@ function App(){
 
             <div className="mxlabel">CROSSFADER</div>
             <input className="xf" type="range" min="0" max="1" step="0.01"
+                   aria-label="Crossfader A / B"
                    value={xfade} onChange={e=>setXfade(parseFloat(e.target.value))}/>
             <div style={{display:'flex',justifyContent:'space-between',fontSize:9,color:'var(--dim)',fontWeight:700}}>
               <span style={{color:'var(--a)'}}>A</span>
@@ -2710,6 +2804,7 @@ function App(){
                 <div className="vpair">
                   <Meter getLevel={()=>E.c.level()}/>
                   <input className="vol" type="range" min="0" max="1" step="0.01"
+                         aria-label="Deck C channel fader"
                          value={volC} onChange={e=>setVolC(parseFloat(e.target.value))}/>
                 </div>
                 <div className="knoblbl" style={{color:'var(--c)'}}>C</div>
@@ -2717,6 +2812,7 @@ function App(){
               <div className="vslot">
                 <div className="vpair">
                   <input className="vol" type="range" min="0" max="1" step="0.01"
+                         aria-label="Deck D channel fader"
                          value={volD} onChange={e=>setVolD(parseFloat(e.target.value))}/>
                   <Meter getLevel={()=>E.d.level()}/>
                 </div>
@@ -2726,6 +2822,7 @@ function App(){
 
             <div className="mxlabel">CROSSFADER</div>
             <input className="xf" type="range" min="0" max="1" step="0.01"
+                   aria-label="Crossfader C / D"
                    value={xfadeCD} onChange={e=>setXfadeCD(parseFloat(e.target.value))}/>
             <div style={{display:'flex',justifyContent:'space-between',fontSize:9,color:'var(--dim)',fontWeight:700}}>
               <span style={{color:'var(--c)'}}>C</span>
@@ -2751,9 +2848,10 @@ function App(){
           <input className="search" placeholder="Search title or artist…"
                  value={q} onChange={e=>setQ(e.target.value)}/>
           <div className="tagchips">
-            <button className={'chip'+(tagFilter===''?' on':'')} onClick={()=>setTagFilter('')}>ALL</button>
+            <button className={'chip'+(tagFilter===''?' on':'')} aria-pressed={tagFilter===''}
+                    onClick={()=>setTagFilter('')}>ALL</button>
             {FX_TAGS.map(tg=>(
-              <button key={tg} className={'chip'+(tagFilter===tg?' on':'')}
+              <button key={tg} className={'chip'+(tagFilter===tg?' on':'')} aria-pressed={tagFilter===tg}
                       style={tagFilter===tg?{background:TAG_COLORS[tg],color:'#000',borderColor:TAG_COLORS[tg]}:null}
                       onClick={()=>setTagFilter(tg)}>{tg}</button>
             ))}
@@ -2765,9 +2863,10 @@ function App(){
           <span className="hint">double-click a row to load the free deck</span>
         </div>
         <div className="cratebar">
-          <button className={'chip'+(activeCrate===null?' on':'')} onClick={()=>setActiveCrate(null)}>ALL TRACKS</button>
+          <button className={'chip'+(activeCrate===null?' on':'')} aria-pressed={activeCrate===null}
+                  onClick={()=>setActiveCrate(null)}>ALL TRACKS</button>
           {crates.map(c=>(
-            <button key={c.id} className={'chip'+(activeCrate===c.id?' on':'')}
+            <button key={c.id} className={'chip'+(activeCrate===c.id?' on':'')} aria-pressed={activeCrate===c.id}
                     onClick={()=>setActiveCrate(c.id)}
                     onDoubleClick={()=>renameCrate(c.id)}
                     title="double-click to rename">
@@ -2785,7 +2884,7 @@ function App(){
           <input className="numin" type="number" placeholder="max" value={bpmMax}
                  onChange={e=>setBpmMax(e.target.value)}/>
           <span className="hint" style={{flex:'none',marginLeft:6}}>KEY</span>
-          <select className="tagsel" style={{width:64,flex:'none'}}
+          <select className="tagsel" style={{width:64,flex:'none'}} aria-label="Filter by key"
                   value={keyFilter} onChange={e=>setKeyFilter(e.target.value)}>
             <option value="">all</option>
             {libKeys.map(k=><option key={k} value={k}>{k}</option>)}
@@ -2801,7 +2900,7 @@ function App(){
             <div key={t.id} className="lrow"
                  onDoubleClick={()=>loadTo(t, firstIdleDeck())}>
               <div className="nm"><b>{t.title}</b> <span style={{color:'var(--dim)'}}>— {t.artist}</span></div>
-              <select className="tagsel" value={t.tag||''}
+              <select className="tagsel" value={t.tag||''} aria-label={`FX tag for ${t.title}`}
                       onClick={e=>e.stopPropagation()}
                       onChange={e=>setTag(t.id, e.target.value)}
                       style={t.tag?{color:'#000',background:TAG_COLORS[t.tag],borderColor:TAG_COLORS[t.tag]}:null}>
@@ -2816,6 +2915,7 @@ function App(){
               <div className="mu">{Math.round(t.file.size/1048576*10)/10} MB</div>
               <div style={{display:'flex',gap:5}}>
                 <select className="tagsel" style={{width:56,flex:'none'}}
+                        aria-label={`Load ${t.title} to a deck`}
                         value="" onClick={e=>e.stopPropagation()}
                         onChange={e=>{ if(e.target.value) loadTo(t,e.target.value); }}>
                   <option value="">→ deck</option>
@@ -2825,6 +2925,7 @@ function App(){
                   <option value="d">D</option>
                 </select>
                 <select className="tagsel" style={{width:30,flex:'none'}} value=""
+                        aria-label={`Add ${t.title} to a crate`}
                         title="add to crate" onClick={e=>e.stopPropagation()}
                         onChange={e=>{ if(e.target.value) addToCrate(e.target.value, t.id); }}>
                   <option value="">🗂</option>
@@ -2834,6 +2935,7 @@ function App(){
                   <button className="mini" title="remove from this crate"
                           onClick={(e)=>{e.stopPropagation();removeFromCrate(activeCrate,t.id);}}>−</button>}
                 <button className="mini" title="remove from library"
+                        aria-label={`Remove ${t.title} from library`}
                         onClick={(e)=>{e.stopPropagation();removeTrack(t.id);}}>✕</button>
               </div>
             </div>
