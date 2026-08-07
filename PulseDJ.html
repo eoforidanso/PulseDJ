@@ -491,20 +491,150 @@ function bpmScore(fromBpm,toBpm){
   return 1-(best/PITCH_RANGE);
 }
 
-// Weighted toward tempo: an out-of-range tempo can't be mixed at all,
-// whereas a key clash is merely less pleasing.
-function trackScore(current,cand){
-  return 0.6*bpmScore(current.bpm,cand.bpm) + 0.4*keyScore(current,cand);
+/* ============================================================
+   ENERGY + PHRASE STRUCTURE
+   ------------------------------------------------------------
+   Both are read off the peak envelope that already exists for the
+   waveform display, so they cost one pass over a few thousand buckets
+   and need no extra stored data.
+   ============================================================ */
+
+// Perceptually-weighted energy, normalised against the track's own peak.
+// Normalising per-track is deliberate: absolute level is mostly a mastering
+// decision, whereas "how loud is this section relative to the rest of this
+// track" is what actually distinguishes a breakdown from a drop, and that
+// comparison does carry across tracks.
+function energyCurve(track){
+  if(track._energy) return track._energy;
+  const p=track.peaks;
+  if(!p || !p.low) return null;
+  const n=p.buckets;
+  const e=new Float32Array(n);
+  let max=0;
+  for(let i=0;i<n;i++){
+    const v=Math.sqrt(0.5*p.low[i]*p.low[i] + 0.3*p.mid[i]*p.mid[i] + 0.2*p.high[i]*p.high[i]);
+    e[i]=v; if(v>max) max=v;
+  }
+  if(max>0) for(let i=0;i<n;i++) e[i]/=max;
+  track._energy=e;
+  return e;
 }
 
-// Best next track from `pool`, excluding anything already played this
-// session or currently sitting on a deck. Returns null when nothing is
-// mixable (e.g. every remaining track is outside pitch range).
+function bucketAt(track,t){
+  const sr=track.buffer && track.buffer.sampleRate;
+  if(!sr) return 0;
+  return Math.floor(t*sr/track.peaks.bucketSamples);
+}
+
+// Mean energy over [t0,t1] seconds, relative to the track's own peak. Use for
+// questions about position WITHIN a track ("is this a breakdown or a drop").
+function sectionEnergy(track,t0,t1){
+  const e=energyCurve(track);
+  if(!e || !e.length) return 0;
+  const a=Math.max(0, Math.min(e.length-1, bucketAt(track,t0)));
+  const b=Math.max(a, Math.min(e.length-1, bucketAt(track,t1)));
+  let s=0;
+  for(let i=a;i<=b;i++) s+=e[i];
+  return s/(b-a+1);
+}
+
+// Un-normalised RMS over [t0,t1]. Use for comparisons BETWEEN tracks: the
+// normalised curve above deliberately divides out each track's own peak, so a
+// uniformly quiet track and a loud one look identical through it — which is
+// precisely the difference that matters when judging whether a mix drops off a
+// cliff. Mastering does vary, but a track that measures 12dB down really is
+// quieter, and that beats being blind to level entirely.
+function rawSectionEnergy(track,t0,t1){
+  const p=track.peaks;
+  if(!p || !p.low) return 0;
+  const n=p.buckets;
+  const a=Math.max(0, Math.min(n-1, bucketAt(track,t0)));
+  const b=Math.max(a, Math.min(n-1, bucketAt(track,t1)));
+  let s=0;
+  for(let i=a;i<=b;i++){
+    s += 0.5*p.low[i]*p.low[i] + 0.3*p.mid[i]*p.mid[i] + 0.2*p.high[i]*p.high[i];
+  }
+  return Math.sqrt(s/(b-a+1));
+}
+
+// Where the phrase grid sits. Beat detection gives a beat phase, not a
+// downbeat, so counting 16s from beatOffset would anchor the grid to an
+// arbitrary beat. In dance music the largest jump in energy — the drop —
+// lands on a phrase boundary essentially by construction, so it makes a far
+// better anchor. Falls back to beatOffset when nothing stands out.
 //
-// Tempo is a hard gate, not just a weighted term: a track SYNC physically
-// cannot reach (bpmScore 0 — more than ±16% away even after octave folds)
-// is unmixable no matter how well its key fits, and the weighted sum alone
-// would still float it to the top on the strength of the key term.
+// This aligns the two decks' 16-beat cycles to each other, which is what
+// stops a blend sounding like a collision. It is not true downbeat
+// detection: if the anchor is off, both decks are off together and
+// consistently, which is the property that matters here.
+const PHRASE_BEATS=16;
+function phraseAnchor(track){
+  if(track._phraseAnchor!==undefined) return track._phraseAnchor;
+  const e=energyCurve(track);
+  const bl=track.bpm ? 60/track.bpm : 0.5;
+  const off=track.analysis ? track.analysis.beatOffset : 0;
+  let anchor=off;
+  if(e && e.length>8){
+    // Smooth over roughly a beat so a single transient can't win.
+    const per=Math.max(1, Math.round(bl*(track.buffer.sampleRate/track.peaks.bucketSamples)));
+    let bestJump=0, bestIdx=-1;
+    for(let i=per;i+per<e.length;i++){
+      let before=0, after=0;
+      for(let k=0;k<per;k++){ before+=e[i-per+k]; after+=e[i+k]; }
+      const jump=(after-before)/per;
+      if(jump>bestJump){ bestJump=jump; bestIdx=i; }
+    }
+    if(bestIdx>0 && bestJump>0.12){
+      const t=bestIdx*track.peaks.bucketSamples/track.buffer.sampleRate;
+      // Snap the anchor onto the beat grid it has to live on.
+      anchor=off+Math.round((t-off)/bl)*bl;
+    }
+  }
+  track._phraseAnchor=anchor;
+  return anchor;
+}
+
+// Next/previous phrase boundary at or after / before `t`, on the track's grid.
+function nextPhrase(track,t){
+  const bl=track.bpm ? 60/track.bpm : 0.5;
+  const P=PHRASE_BEATS*bl, a=phraseAnchor(track);
+  return a+Math.ceil((t-a)/P - 1e-9)*P;
+}
+function snapToPhrase(track,t){
+  const bl=track.bpm ? 60/track.bpm : 0.5;
+  const P=PHRASE_BEATS*bl, a=phraseAnchor(track);
+  const s=a+Math.round((t-a)/P)*P;
+  return s<0 ? a : s;
+}
+
+// How well a candidate's opening follows the outgoing track's closing. A
+// slight lift is the ideal — DJs raise energy across a transition or hold it
+// level; a sudden crash or a jarring jump both read as a mistake.
+function energyScore(current,cand){
+  if(!current || !current.peaks || !cand.peaks) return 0.5;
+  const WIN=30;
+  const out=rawSectionEnergy(current, Math.max(0,current.duration-WIN), current.duration);
+  const start=firstBeatOffset(cand);
+  const inn=rawSectionEnergy(cand, start, start+WIN);
+  if(out<=0 || inn<=0) return 0.5;
+  const dB=20*Math.log10(inn/out);
+  // Measured in dB rather than raw amplitude so the scale matches how the
+  // step is actually heard. A slight lift is ideal; falling away is penalised
+  // harder than climbing, because a mix losing energy reads as a mistake
+  // while a mix gaining it reads as intent.
+  const IDEAL=1.5;
+  const d=dB-IDEAL;
+  return Math.max(0, 1-Math.abs(d)/(d>=0?9:6));
+}
+
+// Weighted toward tempo: an out-of-range tempo can't be mixed at all,
+// whereas a key clash or an energy step is merely less pleasing.
+function trackScore(current,cand){
+  return 0.45*bpmScore(current.bpm,cand.bpm)
+       + 0.30*keyScore(current,cand)
+       + 0.25*energyScore(current,cand);
+}
+
 // Where auto-play should drop the needle. Starting every track at 0:00 means
 // a long silent lead-in or an ambient intro eats the whole blend — the mix
 // fades into nothing. Find the first point the waveform rises above a
@@ -524,14 +654,22 @@ function firstBeatOffset(track){
   for(let i=0;i<pk.length;i++){ if(pk[i]>=th){ idx=i; break; } }
   if(idx<=0) return 0;                       // already loud from the top
   const t=idx*track.peaks.bucketSamples/sr;
-  const bl=60/track.bpm;
-  const off=track.analysis ? track.analysis.beatOffset : 0;
-  const k=Math.floor((t-off)/bl);
-  const snapped=off+k*bl;
+  // Land on a phrase boundary rather than merely a beat. Coming in a beat or
+  // two into a phrase is what makes an automatic mix sound a bar out of step
+  // even when the tempo is locked perfectly.
+  const snapped=snapToPhrase(track,t);
   // Never skip so far in that there's no track left to mix.
   return Math.max(0, Math.min(snapped, Math.max(0, track.duration-30)));
 }
 
+// Best next track from `pool`, excluding anything already played this
+// session or currently sitting on a deck. Returns null when nothing is
+// mixable (e.g. every remaining track is outside pitch range).
+//
+// Tempo is a hard gate, not just a weighted term: a track SYNC physically
+// cannot reach (bpmScore 0 — more than ±16% away even after octave folds)
+// is unmixable no matter how well its key fits, and the weighted sum alone
+// would still float it to the top on the strength of the key term.
 function pickNextTrack(current, pool, excludeIds){
   let best=null, bestScore=-Infinity;
   for(const t of pool){
@@ -2232,8 +2370,6 @@ function App(){
      Everything it does goes through the same primitives the UI does
      (loadTo / doSync / setXfade), so taking over mid-set is just a
      matter of switching it off — nothing to unwind. */
-  const AUTO_XFADE_SEC=8;      // length of the blend
-  const AUTO_LEAD_SEC=12;      // start the blend this far from the end
   const [autoDj,setAutoDj]=useState(false);
   const [autoNext,setAutoNext]=useState(null);   // track queued for the next blend (display only)
   const autoBusy=useRef(false);                  // a transition is in flight — don't start another
@@ -2249,7 +2385,7 @@ function App(){
   },[lib,crates,activeCrate]);
   const autoPoolRef=useRef(autoPool); useEffect(()=>{ autoPoolRef.current=autoPool; },[autoPool]);
 
-  // Animate the crossfader from wherever it is to `target` over AUTO_XFADE_SEC,
+  // Animate the crossfader from wherever it is to `target` over `fadeSec`,
   // moving the same React state a hand would, so the on-screen fader and the
   // audio stay in step.
   //
@@ -2313,16 +2449,36 @@ function App(){
     };
   };
 
-  // Blend timings scaled to the outgoing track. The 12s lead / 8s fade suit a
-  // normal 3-5 minute track, but on a short loop or edit they'd cover the
-  // whole thing — the next blend would start the instant the last one ended,
-  // with no stretch of the track ever playing on its own. Capping both to a
-  // fraction of the duration keeps short material listenable, and the floor on
-  // `lead` guarantees the fade always finishes before the track runs out.
-  const autoTimings=(dur)=>{
-    const fade=Math.min(AUTO_XFADE_SEC, dur*0.25);
-    const lead=Math.max(fade, Math.min(AUTO_LEAD_SEC, dur*0.4));
-    return {fade, lead};
+  // How long the blend should run, in BEATS rather than seconds, chosen from
+  // how well the two tracks actually go together:
+  //
+  //   32 beats  keys sit together and the energy carries over — there's
+  //             nothing to hide, so let the two records breathe.
+  //   16 beats  the normal case.
+  //    8 beats  a key clash or an energy step. Both sound worse the longer
+  //             you hold them, so get through it.
+  //
+  // Whole phrases only, so the blend starts and ends at the same point in
+  // both tracks' 16-beat cycles. Falls back to shorter lengths when the
+  // outgoing track hasn't the room, and the whole thing is scaled by the
+  // deck's rate so the beat count is honoured at the pitch actually playing.
+  const autoPlan=(deck,cand)=>{
+    const cur=deck.track;
+    const bl=(deck.bpm ? 60/deck.bpm : 0.5);
+    const phraseSec=PHRASE_BEATS*bl;
+    const compat=cur&&cand ? 0.55*keyScore(cur,cand)+0.45*energyScore(cur,cand) : 0.5;
+    let beats = compat>=0.78 ? 32 : compat>=0.5 ? 16 : 8;
+
+    // The blend plus a phrase of slack to wait for a boundary has to fit in
+    // the track, and shouldn't swallow more than a third of it.
+    const budget=Math.min(deck.duration*0.33, Math.max(0, deck.duration-2));
+    while(beats>8 && beats*bl+phraseSec>budget) beats/=2;
+
+    const fade=Math.min(beats*bl, Math.max(1, budget));
+    // Start hunting for a phrase boundary a phrase before the blend is due,
+    // so there's always one to catch.
+    const lead=fade+phraseSec;
+    return {beats, fade, lead, phraseSec, compat};
   };
 
   useEffect(()=>{
@@ -2370,8 +2526,9 @@ function App(){
       const deck=E[from];
       const remain=deck.duration-deck.position();
 
-      const {fade,lead}=autoTimings(deck.duration);
-      if(remain>lead) return;
+      // Widest plan this track could need, purely to decide whether it's yet
+      // worth looking for a partner. The real plan depends on which track wins.
+      if(remain>autoPlan(deck,null).lead) return;
 
       let exclude=new Set(autoPlayed.current);
       if(E[to].track) exclude.add(E[to].track.id);
@@ -2386,10 +2543,28 @@ function App(){
       }
       if(!pick) return;   // genuinely nothing mixable — let the current track ride out
 
+      // Now the pair is known, size the blend to how well they actually fit.
+      const {beats,fade,lead}=autoPlan(deck,pick.track);
+      if(remain>lead) return;
+
       autoBusy.current=true;
       try{
+        // Hold until the outgoing track crosses a phrase boundary, so the
+        // blend begins where a bar does. Everything downstream is already
+        // beat-locked; this is what additionally lines up the 16-beat cycles,
+        // and it's the difference between a mix that lands and one that's
+        // technically in time but a bar out of step.
+        const pos=deck.position();
+        const waitSrc=nextPhrase(deck.track,pos)-pos;
+        const waitSec=waitSrc/Math.max(0.05,deck.rate);
+        // Only wait if the blend still finishes with room to spare afterwards.
+        if(waitSec>0.05 && waitSec<remain-fade){
+          await new Promise(r=>setTimeout(r, waitSec*1000));
+          if(!autoDj || !deck.playing){ autoBusy.current=false; return; }
+        }
         await loadTo(pick.track,to);
         autoPlayed.current.add(pick.track.id);
+        pick.track._beats=beats;          // shown in the topbar readout
         setAutoNext(pick.track);
         // Drop in at the first beat, not 0:00, so a quiet intro doesn't get
         // spent on the blend. Seek before play/sync: lockToLeader preserves
@@ -2596,7 +2771,8 @@ function App(){
           {autoDj?'■ AUTO ON':'✨ AUTO DJ'}
         </button>
         {autoDj && <span className="hint" style={{maxWidth:150,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
-          {autoNext?`→ ${autoNext.title}`:`${autoPool.length} in pool`}
+          {autoNext?`→ ${autoNext.title}${autoNext._beats?` · ${autoNext._beats} beats`:''}`
+                   :`${autoPool.length} in pool`}
         </span>}
         <button className={'btn rec'+(recording?' on':'')} onClick={toggleRec}>
           {recording?'■ STOP REC':'● REC MIX'}
